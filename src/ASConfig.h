@@ -15,10 +15,12 @@ class ASConfig
 {
 public:
     // Sized to allow indexing directly by an AuctionHouseId's raw numeric value
-    // (Alliance=2, Horde=6) without remapping to a dense range; must be at least
-    // Horde+1=7. AuctionHouseId::Neutral(7) is never used as an index here --
-    // auctionsim.dat only ever contains faction values 2 and 6.
-    static constexpr size_t kAuctionHouseIndexBound = 7;
+    // (Alliance=2, Horde=6, Neutral=7) without remapping to a dense range; must be
+    // at least Neutral+1=8. auctionsim.dat itself only ever contains faction values
+    // 2 and 6 -- the Neutral(7) bucket is populated separately by
+    // BuildNeutralSelectionTable from items marked neutral-eligible (see
+    // IsNeutralEligible / AuctionSim.NeutralItems), not from scanned rows.
+    static constexpr size_t kAuctionHouseIndexBound = 8;
 
     // A category-depth header row is faction:class:quality:snapshotCount followed
     // by one 12-value StatBlock -- 16 fields.
@@ -38,6 +40,43 @@ public:
     std::unordered_set<uint32> vendorSoldItems;
     bool IsVendorSold(uint32 itemId) const { return vendorSoldItems.count(itemId) > 0; }
 
+    // Whether the Neutral (goblin) auction houses are populated at all. From
+    // AuctionSim.EnableNeutralAH. When false, kAuctionHouseIndexBound's Neutral
+    // slot is simply never filled or scanned.
+    bool enableNeutralAH = false;
+
+    // How often the module rescans the auction houses, in seconds. From
+    // AuctionSim.ScanIntervalMinutes (minutes in the conf file, seconds here --
+    // matches AuctionPricing::CalculateRemainingScans' unit). Floored at 5 minutes:
+    // shorter than that risks the bot fighting itself (buy/list decisions racing a
+    // scan pass still being processed) and hammering the AH tables unnecessarily.
+    uint32 scanIntervalSeconds = 3600;
+
+    // Explicit item-id allowlist for the Neutral bucket, from
+    // AuctionSim.NeutralItems (comma-separated item template ids in
+    // auctionsim.conf) -- curated by the server owner rather than inferred, since
+    // ItemTemplate's faction/race masks are not a reliable signal of "only
+    // obtainable via the opposing faction" in 3.3.5a data. An item on this list
+    // still lists normally on its native Alliance/Horde house AND is additionally
+    // listed on the Neutral house, so the opposing faction has a legitimate way to
+    // buy it too -- it is never removed from its native bucket.
+    std::unordered_set<uint32> neutralEligibleItems;
+    bool IsNeutralEligible(uint32 itemId) const { return neutralEligibleItems.count(itemId) > 0; }
+
+    // Explicit per-item, per-house auction house exceptions, from
+    // AuctionSim.ItemExceptions (comma-separated "itemId:bitmask" pairs in
+    // auctionsim.conf, e.g. "6661:7" for Savory Deviate Delight Recipe banned
+    // everywhere). Bit 1 = Alliance, bit 2 = Horde, bit 4 = Neutral; bits combine
+    // by addition (3 = Alliance+Horde, 7 = all three). This is a manual override
+    // list for items the ItemLevel/RequiredLevel caps don't catch -- e.g. a
+    // low-level recipe or quest reward that's still undesirable to auto-list --
+    // rather than a replacement for those caps. Checked at the same point a
+    // level-cap failure is (ListOneItem / CleanOverCapAuctions), so it behaves
+    // identically: a banned item is simply never listed on that house, and any
+    // of the bot's existing auctions for it there are treated as over-cap.
+    std::unordered_map<uint32, uint8> itemHouseExceptions;
+    bool IsItemExcludedFromHouse(uint32 itemId, AuctionHouseId houseId) const;
+
     // ScannedItem storage. A std::deque, not a vector: the ScannedItem* kept in
     // ItemSelectionTable / ItemIndex must stay valid as rows are appended, and a
     // deque never relocates existing elements on growth (a vector would).
@@ -50,6 +89,30 @@ public:
     // O(1) during a scan instead of a linear bucket walk. First row wins on the
     // rare duplicate key (suffix is not part of the key, matching the old search).
     std::unordered_map<uint64_t, ScannedItem const*> ItemIndex;
+
+    // itemID -> its row, independent of house/class/quality -- for the addon's
+    // item pricer, which only knows an item id (from a drag-drop) and needs to
+    // answer "does this item already have pricing data at all". First row wins
+    // on a duplicate itemID scanned into multiple houses.
+    std::unordered_map<uint32, ScannedItem const*> ByItemId;
+    ScannedItem const* FindAnyScan(uint32 itemId) const;
+
+    // Adds or replaces a GM-entered price for one item (see ScannedItem::FromOverride),
+    // filing it into ScanData/ItemSelectionTable/ItemIndex/ByItemId exactly like a
+    // real scanned row, and persists it to auctionsim_overrides.dat so it survives a
+    // restart. neutralEligible mirrors AuctionSim.NeutralItems -- true also files the
+    // item into the Neutral bucket (in addition to its native house). Returns false
+    // only if the item's template can't be resolved or the overrides file can't be
+    // written.
+    bool UpsertOverride(
+        uint32 itemId,
+        uint32 marketPrice,
+        uint32 listLow,
+        uint32 listHigh,
+        uint32 typicalStack,
+        uint32 stackLow,
+        uint32 stackHigh,
+        bool neutralEligible);
 
     // Per-(itemClass, quality) listing multiplier vs. the real market, from the
     // AuctionSim.<Class>Percent config lines. Plain decimals (1, 1.5, 0.25, 0).
@@ -109,6 +172,18 @@ private:
     void BuildSelectionTables(std::string const& filepath);
     void LoadMasks();
     void LoadVendorItems();
+    void LoadNeutralConfig();
+    void SynthesizeNeutralDepth();
+    void LoadOverrides();
+    void LoadItemExceptions();
+
+    // Overrides persist next to auctionsim.dat as auctionsim_overrides.dat, one
+    // "itemId:faction:marketPrice:listLow:listHigh:typicalStack:stackLow:stackHigh:neutralEligible"
+    // line per item -- kept separate from auctionsim.dat since that file is
+    // regenerated wholesale by data/compile-data.cpp and a GM's manual entries
+    // would otherwise be silently lost on the next scan-data refresh.
+    std::string overridesFilePath;
+    bool WriteOverridesFile() const;
 
     void UnpackQualityString(std::string_view qualityString, int itemClass);
 };

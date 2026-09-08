@@ -4,7 +4,7 @@
 #include <vector>
 #include "ASConfig.h"
 #include "AuctionPricing.h"
-#include "Bot.h"
+#include "BotPool.h"
 #include "Item.h"
 #include "Log.h"
 #include "ObjectMgr.h"
@@ -25,7 +25,7 @@ namespace
     }
 }
 
-AuctionListingService::AuctionListingService(Bot& bot, ASConfig const& config) : _bot(bot), _config(config) {}
+AuctionListingService::AuctionListingService(BotPool& botPool, ASConfig const& config) : _botPool(botPool), _config(config) {}
 
 void AuctionListingService::ListNewAuctions(
     AuctionHouseId houseId,
@@ -144,7 +144,7 @@ void AuctionListingService::ListNewAuctions(
                 }
                 else
                 {
-                    dropWeight(idx);  // level cap / missing template -- don't retry it
+                    dropWeight(idx);  // level cap / item exception / missing template -- don't retry it
                 }
             }
         }
@@ -177,6 +177,15 @@ AuctionEntry* AuctionListingService::ListOneItem(
         return nullptr;
     }
 
+    // Explicit per-item/per-house ban (AuctionSim.ItemExceptions) -- the catch-all
+    // for items the ItemLevel/RequiredLevel caps above don't reach. Same
+    // "return nullptr, caller drops its weight and won't retry" contract as the
+    // level-cap check.
+    if (_config.IsItemExcludedFromHouse(scan.GetItemID(), houseId))
+    {
+        return nullptr;
+    }
+
     uint32 quantity = AuctionPricing::RollStackSize(
         scan.GetTypicalStackSize(), scan.GetStackLow(), scan.GetStackHigh(), proto->GetMaxStackSize());
     uint32 buyout = AuctionPricing::RollBuyoutPrice(
@@ -193,7 +202,10 @@ AuctionEntry* AuctionListingService::ListOneItem(
     // round-trip correctly through the bit-preserving uint32<->int32 conversion.
     Item* item =
         Item::CreateItem(scan.GetItemID(), quantity, nullptr, false, static_cast<uint32>(scan.GetSuffixID()));
-    item->SetOwnerGUID(_bot.GetPlayerRef().GetGUID());
+    // Pick this listing's seller round-robin from the roster so listings spread
+    // across every bot character instead of piling onto one.
+    Player& seller = _botPool.NextPlayer();
+    item->SetOwnerGUID(seller.GetGUID());
 
     AuctionEntry* auction = new AuctionEntry();
     auction->Id = sObjectMgr->GenerateAuctionID();
@@ -201,7 +213,7 @@ AuctionEntry* AuctionListingService::ListOneItem(
     auction->item_guid = item->GetGUID();
     auction->item_template = item->GetEntry();
     auction->itemCount = quantity;
-    auction->owner = _bot.GetPlayerRef().GetGUID();
+    auction->owner = seller.GetGUID();
     auction->startbid = buyout;
     auction->buyout = buyout;
     auction->bid = 0;

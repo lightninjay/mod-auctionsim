@@ -57,6 +57,7 @@ private:
     StatBlock stack;
     StatBlock listing;
     uint32 listingSnapshotCount = 0;
+    bool isOverride = false;
 
     ScannedItem() = default;
 
@@ -101,6 +102,25 @@ public:
     // Number of AH snapshots this item appeared in (confidence for the count stat).
     uint32 GetListingSnapshotCount() const { return listingSnapshotCount; }
 
-    // Parses one fixed kRowFields-field auctionsim.dat item row. std::nullopt if malformed.
+    // True if this row came from ASConfig::UpsertOverride (a GM-entered price via
+    // the ahsim addon's item pricer) rather than a real auctionsim.dat scan row.
+    bool IsOverride() const { return isOverride; }
+
+    // Builds a row from a single GM-entered price point rather than a full scan
+    // stat block -- every stat-triple field FirstPositive() could read is filled
+    // from the same handful of inputs, so every getter above still returns sane
+    // values. sampleCount/listingSnapshotCount are set to 1 (present but
+    // low-confidence, never treated as "no data").
+    static ScannedItem FromOverride(
+        uint8 factionNum,
+        uint32 itemID,
+        uint32 marketPrice,
+        uint32 listLow,
+        uint32 listHigh,
+        uint32 typicalStack,
+        uint32 stackLow,
+        uint32 stackHigh);
+
+    // Parses kRowFields-field auctionsim.dat item row. std::nullopt if malformed.
     static std::optional<ScannedItem> TryParse(std::string_view dataLine);
 };

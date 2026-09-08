@@ -181,13 +181,14 @@ namespace AuctionPricing
 
     BuyTolerance RollBuyTolerance() { return {frand(kToleranceBoundaryMin, kToleranceBoundaryMax)}; }
 
-    uint32 CalculateRemainingScans(time_t remainingSeconds)
+    uint32 CalculateRemainingScans(time_t remainingSeconds, uint32 scanIntervalSeconds)
     {
         if (remainingSeconds <= 0)
         {
             return 1;
         }
-        return static_cast<uint32>((remainingSeconds + kScanIntervalSeconds - 1) / kScanIntervalSeconds);
+        uint32 interval = scanIntervalSeconds > 0 ? scanIntervalSeconds : kDefaultScanIntervalSeconds;
+        return static_cast<uint32>((remainingSeconds + interval - 1) / interval);
     }
 
     bool ShouldBuyAtPrice(

@@ -1,4 +1,6 @@
 #include "AuctionSimAddonBridge.h"
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <string>
 #include <string_view>
@@ -9,6 +11,10 @@
 #include "ASParse.h"
 #include "AuctionHouseMgr.h"
 #include "AuctionSim.h"
+#include "ItemPriceSuggestion.h"
+#include "ObjectMgr.h"
+#include <charconv>
+#include <unordered_set>
 #include "CharacterCache.h"
 #include "Common.h"
 #include "Config.h"
@@ -42,6 +48,9 @@ namespace
         constexpr std::string_view CleanOverCap = "CLEANOVERCAP";
         constexpr std::string_view ShowQueue = "SHOWQUEUE";
         constexpr std::string_view SetBotChar = "SETBOTCHAR";
+        constexpr std::string_view ItemQuery = "ITEMQUERY";
+        constexpr std::string_view ItemPriceSet = "ITEMPRICESET";
+        constexpr std::string_view ItemSearch = "ITEMSEARCH";
 
         // Outbound: server -> client message types.
         constexpr std::string_view Error = "ERROR";
@@ -54,6 +63,10 @@ namespace
         constexpr std::string_view QueueInfo = "QUEUEINFO";
         constexpr std::string_view CleanResult = "CLEANRESULT";
         constexpr std::string_view SetBotCharResult = "SETBOTCHARRESULT";
+        constexpr std::string_view ItemPrice = "ITEMPRICE";
+        constexpr std::string_view ItemPriceSetResult = "ITEMPRICESETRESULT";
+        constexpr std::string_view ItemSearchResult = "ITEMSEARCHRESULT";
+        constexpr std::string_view ItemSearchDone = "ITEMSEARCHDONE";
     }
 
     // SETCONFIG keys awaiting a SAVECONFIG. One global set: worldserver hooks are
@@ -280,6 +293,11 @@ namespace
 
         AuctionSim::instance()->ScanAuctions(AuctionHouseId::Alliance);
         AuctionSim::instance()->ScanAuctions(AuctionHouseId::Horde);
+        ASConfig* scanConfig = AuctionSim::instance()->GetConfig();
+        if (scanConfig && scanConfig->enableNeutralAH)
+        {
+            AuctionSim::instance()->ScanAuctions(AuctionHouseId::Neutral);
+        }
 
         size_t after = AuctionSim::instance()->GetBuyQueue().size();
         auto end = std::chrono::high_resolution_clock::now();
@@ -400,10 +418,38 @@ namespace
         uint32 characterId = entry->Guid.GetCounter();
         uint32 accountId = entry->AccountId;
 
+        // ADDS this character to the roster rather than replacing it -- with
+        // multiple bot characters supported, "Set Bot Char" from the addon now
+        // means "add this character," not "swap to this one character." Merge
+        // against whatever BotCharacterIDs already holds, de-duping.
+        std::string existingCsv = sConfigMgr->GetOption<std::string>("AuctionSim.BotCharacterIDs", "");
+        std::unordered_set<uint32> ids;
+        for (std::string_view tok : Acore::Tokenize(existingCsv, ',', false))
+        {
+            uint32 id = 0;
+            auto [ptr, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), id);
+            (void)ptr;
+            if (ec == std::errc() && id != 0)
+            {
+                ids.insert(id);
+            }
+        }
+        ids.insert(characterId);
+
+        std::string merged;
+        bool first = true;
+        for (uint32 id : ids)
+        {
+            if (!first)
+            {
+                merged += ",";
+            }
+            merged += Acore::StringFormat("{}", id);
+            first = false;
+        }
+
         bool wrote = ASConfigWriter::SetMany(
-            GetConfFilePath(),
-            {{"BotCharacterID", "", Acore::StringFormat("{}", characterId)},
-             {"BotAccountID", "", Acore::StringFormat("{}", accountId)}});
+            GetConfFilePath(), {{"BotCharacterIDs", "", merged}});
         if (!wrote)
         {
             SendMessage(
@@ -414,16 +460,16 @@ namespace
             return;
         }
 
-        // enabled -> swap the bot live; disabled -> it waits for enable
+        // enabled -> rebuild the roster live; disabled -> it waits for enable
         AuctionSim* sim = AuctionSim::instance();
         std::string note;
         if (!sim->isEnabled)
         {
-            note = "Saved. The bot will start on this character when you enable the module.";
+            note = "Saved. This character joins the bot roster when you enable the module.";
         }
         else if (sim->StartOrReloadBot())
         {
-            note = "Bot reloaded; no restart needed.";
+            note = Acore::StringFormat("Bot roster reloaded ({} character(s)); no restart needed.", ids.size());
         }
         else
         {
@@ -440,6 +486,205 @@ namespace
     void HandleWhoAmI(Player* target, std::vector<std::string_view> const&)
     {
         SendMessage(target, Acore::StringFormat("{}\tok", Msg::WhoAmI));
+    }
+
+    // Answers "what would this item auto-price at" for the addon's drag-drop item
+    // pricer. tokens[1] is the item template id (the addon resolves whatever was
+    // dropped -- item link, bag slot, etc. -- to an id client-side before sending).
+    // Reply: ITEMPRICE\titemId\tsource\tmarketPrice\tlistLow\tlistHigh\ttypicalStack
+    //        \tstackLow\tstackHigh\tneutralEligible\tbasisNote
+    // source is "override" (a GM already priced this), "scan" (real auctionsim.dat
+    // data exists), or "suggested" (neither -- see ItemPriceSuggestion). Every
+    // numeric field is intentionally still editable client-side regardless of source.
+    void HandleItemQuery(Player* target, std::vector<std::string_view> const& tokens)
+    {
+        if (tokens.size() < 2)
+        {
+            SendError(target, "ITEMQUERY needs an item id");
+            return;
+        }
+        uint32 itemId = 0;
+        if (!ASParse::Integer(tokens[1], itemId) || itemId == 0)
+        {
+            SendError(target, "ITEMQUERY: bad item id");
+            return;
+        }
+
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+        if (!proto)
+        {
+            SendError(target, Acore::StringFormat("ITEMQUERY: no item_template for {}", itemId));
+            return;
+        }
+
+        ASConfig* config = AuctionSim::instance()->GetConfig();
+        if (!config)
+        {
+            SendError(target, "ITEMQUERY: AuctionSim config not loaded");
+            return;
+        }
+
+        bool neutralEligible = config->IsNeutralEligible(itemId);
+
+        if (ScannedItem const* existing = config->FindAnyScan(itemId))
+        {
+            SendMessage(
+                target,
+                Acore::StringFormat(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    Msg::ItemPrice,
+                    itemId,
+                    existing->IsOverride() ? "override" : "scan",
+                    existing->GetMarketPrice(),
+                    existing->GetListLow(),
+                    existing->GetListHigh(),
+                    existing->GetTypicalStackSize(),
+                    existing->GetStackLow(),
+                    existing->GetStackHigh(),
+                    neutralEligible ? 1 : 0,
+                    existing->IsOverride() ? "GM-entered price" : "from real auction scan data"));
+            return;
+        }
+
+        ItemPriceSuggestion::Suggestion s = ItemPriceSuggestion::Suggest(proto, itemId);
+        SendMessage(
+            target,
+            Acore::StringFormat(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                Msg::ItemPrice,
+                itemId,
+                "suggested",
+                s.marketPrice,
+                s.listLow,
+                s.listHigh,
+                s.typicalStack,
+                s.stackLow,
+                s.stackHigh,
+                neutralEligible ? 1 : 0,
+                s.basis));
+    }
+
+    // Case-insensitive substring search, ASCII-only (item names in item_template
+    // are English; this mirrors what the client types).
+    bool ContainsCaseInsensitive(std::string_view haystack, std::string_view needle)
+    {
+        if (needle.empty())
+        {
+            return true;
+        }
+        auto toLower = [](unsigned char c) { return static_cast<char>(std::tolower(c)); };
+        std::string h(haystack.size(), '\0');
+        std::string n(needle.size(), '\0');
+        std::transform(haystack.begin(), haystack.end(), h.begin(), toLower);
+        std::transform(needle.begin(), needle.end(), n.begin(), toLower);
+        return h.find(n) != std::string::npos;
+    }
+
+    // Name lookup for the Price Search tab -- mirrors Auctionator's typed item
+    // search, but against the server's real item_template rather than a client-
+    // side item cache, so it works for anything the bot can list even if the GM
+    // has never seen it. tokens[1] is the (possibly multi-word, already rejoined
+    // by the client) search text. Replies with up to kMaxSearchResults
+    // ITEMSEARCHRESULT rows, each "itemId\tname\tquality", then one
+    // ITEMSEARCHDONE\tshownCount\ttotalMatches so the client can show "N more --
+    // refine your search" when the list was truncated.
+    void HandleItemSearch(Player* target, std::vector<std::string_view> const& tokens)
+    {
+        constexpr size_t kMaxSearchResults = 20;
+
+        if (tokens.size() < 2 || tokens[1].empty())
+        {
+            SendError(target, "ITEMSEARCH needs search text");
+            return;
+        }
+
+        // The client rejoins the original tab-free search text as a single token,
+        // but guard anyway: treat every remaining token as part of the phrase in
+        // case something upstream re-split on a stray tab.
+        std::string needle(tokens[1]);
+        for (size_t i = 2; i < tokens.size(); ++i)
+        {
+            needle += ' ';
+            needle += tokens[i];
+        }
+
+        ItemTemplateContainer const* store = sObjectMgr->GetItemTemplateStore();
+
+        // Collect every match first and sort by name -- unordered_map iteration
+        // order is arbitrary, and an alphabetical list reads like Auctionator's
+        // own search results instead of shuffling every time.
+        struct Match
+        {
+            uint32 itemId;
+            std::string const* name;
+            uint32 quality;
+        };
+        std::vector<Match> matches;
+        for (auto const& [itemId, proto] : *store)
+        {
+            if (!proto.Name1.empty() && ContainsCaseInsensitive(proto.Name1, needle))
+            {
+                matches.push_back({itemId, &proto.Name1, proto.Quality});
+            }
+        }
+        std::sort(matches.begin(), matches.end(), [](Match const& a, Match const& b) { return *a.name < *b.name; });
+
+        size_t shown = std::min(matches.size(), kMaxSearchResults);
+        for (size_t i = 0; i < shown; ++i)
+        {
+            SendMessage(
+                target,
+                Acore::StringFormat(
+                    "{}\t{}\t{}\t{}", Msg::ItemSearchResult, matches[i].itemId, *matches[i].name,
+                    matches[i].quality));
+        }
+
+        SendMessage(target, Acore::StringFormat("{}\t{}\t{}", Msg::ItemSearchDone, shown, matches.size()));
+    }
+
+    // Saves a GM-edited (or GM-accepted-as-is) price from the item pricer.
+    // tokens: itemId, marketPrice, listLow, listHigh, typicalStack, stackLow,
+    // stackHigh, neutralEligible(0/1).
+    void HandleItemPriceSet(Player* target, std::vector<std::string_view> const& tokens)
+    {
+        if (tokens.size() < 9)
+        {
+            SendMessage(target, Acore::StringFormat("{}\tfail\tmissing fields", Msg::ItemPriceSetResult));
+            return;
+        }
+
+        uint32 itemId = 0, marketPrice = 0, listLow = 0, listHigh = 0;
+        uint32 typicalStack = 0, stackLow = 0, stackHigh = 0, neutralFlag = 0;
+        bool parsed = ASParse::Integer(tokens[1], itemId) && ASParse::Integer(tokens[2], marketPrice) &&
+            ASParse::Integer(tokens[3], listLow) && ASParse::Integer(tokens[4], listHigh) &&
+            ASParse::Integer(tokens[5], typicalStack) && ASParse::Integer(tokens[6], stackLow) &&
+            ASParse::Integer(tokens[7], stackHigh) && ASParse::Integer(tokens[8], neutralFlag);
+        if (!parsed || itemId == 0 || marketPrice == 0)
+        {
+            SendMessage(target, Acore::StringFormat("{}\tfail\tinvalid values", Msg::ItemPriceSetResult));
+            return;
+        }
+
+        ASConfig* config = AuctionSim::instance()->GetConfig();
+        if (!config)
+        {
+            SendMessage(target, Acore::StringFormat("{}\tfail\tconfig not loaded", Msg::ItemPriceSetResult));
+            return;
+        }
+
+        bool ok = config->UpsertOverride(
+            itemId, marketPrice, listLow, listHigh, typicalStack, stackLow, stackHigh, neutralFlag != 0);
+        if (!ok)
+        {
+            SendMessage(
+                target,
+                Acore::StringFormat(
+                    "{}\tfail\titem {} not found or couldn't write overrides file", Msg::ItemPriceSetResult,
+                    itemId));
+            return;
+        }
+
+        SendMessage(target, Acore::StringFormat("{}\tok\t{}", Msg::ItemPriceSetResult, itemId));
     }
 
     using CommandHandler = void (*)(Player*, std::vector<std::string_view> const&);
@@ -461,6 +706,9 @@ namespace
         {Msg::CleanOverCap, HandleCleanOverCap},
         {Msg::ShowQueue, HandleShowQueue},
         {Msg::SetBotChar, HandleSetBotChar},
+        {Msg::ItemQuery, HandleItemQuery},
+        {Msg::ItemPriceSet, HandleItemPriceSet},
+        {Msg::ItemSearch, HandleItemSearch},
     };
 
     void HandleRequest(Player* player, std::string const& payload)

@@ -9,7 +9,7 @@
 #include "AuctionHouseMgr.h"
 #include "AuctionHouseSearcher.h"
 #include "AuctionPricing.h"
-#include "Bot.h"
+#include "BotPool.h"
 #include "Config.h"
 #include "DatabaseEnvFwd.h"
 #include "Define.h"
@@ -23,10 +23,11 @@ namespace
     // Collects every bot-owned auction on `houseId` that `shouldRemove` accepts, then
     // deletes them in a second pass -- so the live house map is never mutated while it
     // is being iterated, and it is never copied. Returns the number removed.
+    // "Bot-owned" now means owned by any character in the roster, not a single GUID.
     template <typename Predicate>
     uint32 RemoveBotAuctionsIf(
         AuctionHouseId houseId,
-        ObjectGuid botGuid,
+        BotPool const& pool,
         SQLTransaction<CharacterDatabaseConnection>& trans,
         Predicate shouldRemove)
     {
@@ -36,7 +37,7 @@ namespace
         for (auto const& entry : house->GetAuctions())
         {
             AuctionEntry* auction = entry.second;
-            if (auction->owner == botGuid && shouldRemove(auction))
+            if (pool.Owns(auction->owner) && shouldRemove(auction))
             {
                 toRemove.push_back(auction);
             }
@@ -53,11 +54,26 @@ namespace
 
     bool IsBotCharacter(uint32 lowGuid)
     {
-        // Read the running bot's character id rather than re-parsing config: this
-        // hook fires for every mail delivered server-wide.
+        // Read the running roster rather than re-parsing config: this hook fires
+        // for every mail delivered server-wide.
         AuctionSim* sim = AuctionSim::instance();
-        uint32 botLowGuid = sim ? sim->GetBotCharacterLowGuid() : 0;
-        return botLowGuid != 0 && lowGuid == botLowGuid;
+        return sim && sim->IsBotOwnedLowGuid(lowGuid);
+    }
+}
+
+namespace
+{
+    // Alliance/Horde always scanned; Neutral only when configured on. Centralizes
+    // the set so OnStartup/OnUpdate/CleanOverCapAuctions/DeleteAuctions/RunTests
+    // stay in sync instead of each hardcoding their own {Alliance, Horde} pair.
+    std::vector<AuctionHouseId> ActiveHouses(ASConfig const* config)
+    {
+        std::vector<AuctionHouseId> houses{AuctionHouseId::Alliance, AuctionHouseId::Horde};
+        if (config && config->enableNeutralAH)
+        {
+            houses.push_back(AuctionHouseId::Neutral);
+        }
+        return houses;
     }
 }
 
@@ -148,8 +164,10 @@ void AuctionSim::OnStartup()
 
     if (this->startupScan)
     {
-        ScanAuctions(AuctionHouseId::Alliance);
-        ScanAuctions(AuctionHouseId::Horde);
+        for (AuctionHouseId houseId : ActiveHouses(config.get()))
+        {
+            ScanAuctions(houseId);
+        }
         LOG_INFO("module", "AuctionSim: Startup complete");
     }
 }
@@ -168,26 +186,26 @@ bool AuctionSim::StartOrReloadBot(bool reloadConfig)
         return false;
     }
 
-    // Throwaway flag: a bad/unset id must not clear the module's isEnabled or kill a
-    // running bot.
+    // Throwaway flag: a roster that fails to resolve must not clear the module's
+    // isEnabled or kill a running roster.
     bool built = true;
-    auto newBot = std::make_unique<Bot>(built);
-    if (!built || !newBot->GetPlayer())
+    auto newPool = std::make_unique<BotPool>(built);
+    if (!built || newPool->Empty())
     {
         return false;
     }
 
-    // Retire the old bot rather than destroying it (its headless Player is only ever
-    // torn down at shutdown); rebuild the services, which hold a Bot&.
-    if (bot)
+    // Retire the old roster rather than destroying it (each headless Player is only
+    // ever torn down at shutdown); rebuild the services, which hold a BotPool&.
+    if (botPool)
     {
-        retiredBots.push_back(std::move(bot));
+        retiredBotPools.push_back(std::move(botPool));
     }
-    bot = std::move(newBot);
-    listingService = std::make_unique<AuctionListingService>(*bot, *config);
-    buyingService = std::make_unique<AuctionBuyingService>(*bot);
+    botPool = std::move(newPool);
+    listingService = std::make_unique<AuctionListingService>(*botPool, *config);
+    buyingService = std::make_unique<AuctionBuyingService>(*botPool, *config);
 
-    LOG_INFO("module", "AuctionSim: bot active (character {})", bot->GetCharacterID());
+    LOG_INFO("module", "AuctionSim: bot roster active ({} characters)", botPool->Size());
     return true;
 }
 
@@ -198,10 +216,12 @@ void AuctionSim::OnUpdate(uint32 diff)
 
     scanTimer += diff;
 
-    if (scanTimer >= AuctionPricing::kScanIntervalSeconds * 1000)
+    if (scanTimer >= config->scanIntervalSeconds * 1000)
     {
-        ScanAuctions(AuctionHouseId::Alliance);
-        ScanAuctions(AuctionHouseId::Horde);
+        for (AuctionHouseId houseId : ActiveHouses(config.get()))
+        {
+            ScanAuctions(houseId);
+        }
         scanTimer = 0;
     }
 
@@ -215,8 +235,6 @@ void AuctionSim::ScanAuctions(AuctionHouseId _AuctionHouseId)
     auto const& auctions = sAuctionMgr->GetAuctionsMapByHouseId(_AuctionHouseId)->GetAuctions();
     int auctionTable[MAX_ITEM_CLASS][MAX_ITEM_QUALITY] = {};
     std::unordered_map<uint32, int> itemAuctionCount;
-
-    ObjectGuid const botGuid = bot->GetPlayer()->GetGUID();
 
     buyingService->RollTolerance();
 
@@ -237,7 +255,7 @@ void AuctionSim::ScanAuctions(AuctionHouseId _AuctionHouseId)
         auctionTable[proto->Class][proto->Quality]++;
         itemAuctionCount[auction->item_template]++;
 
-        if (auction->owner == botGuid)
+        if (botPool->Owns(auction->owner))
         {
             continue;
         }
@@ -277,20 +295,19 @@ void AuctionSim::ScanAuctions(AuctionHouseId _AuctionHouseId)
 
 std::vector<AuctionSimTests::TestResult> AuctionSim::RunTests()
 {
-    std::vector<AuctionSimTests::TestResult> results = AuctionSimTests::RunLogicTests(*bot, *config);
+    std::vector<AuctionSimTests::TestResult> results = AuctionSimTests::RunLogicTests(*botPool, *config);
 
-    results.push_back(
-        AuctionSimTests::RunLiveListingTest(*bot, *config, *listingService, AuctionHouseId::Alliance));
-    results.push_back(AuctionSimTests::RunLiveListingTest(*bot, *config, *listingService, AuctionHouseId::Horde));
-
-    results.push_back(
-        AuctionSimTests::RunLiveBuyingTest(*bot, *config, *listingService, AuctionHouseId::Alliance));
-    results.push_back(AuctionSimTests::RunLiveBuyingTest(*bot, *config, *listingService, AuctionHouseId::Horde));
-
-    results.push_back(
-        AuctionSimTests::RunLiveLevelCapTest(*bot, *config, *listingService, AuctionHouseId::Alliance));
-    results.push_back(
-        AuctionSimTests::RunLiveLevelCapTest(*bot, *config, *listingService, AuctionHouseId::Horde));
+    for (AuctionHouseId houseId : ActiveHouses(config.get()))
+    {
+        results.push_back(
+            AuctionSimTests::RunLiveListingTest(*botPool, *config, *listingService, houseId));
+        results.push_back(
+            AuctionSimTests::RunLiveBuyingTest(*botPool, *config, *listingService, houseId));
+        results.push_back(
+            AuctionSimTests::RunLiveLevelCapTest(*botPool, *config, *listingService, houseId));
+        results.push_back(
+            AuctionSimTests::RunLiveItemExceptionTest(*botPool, *config, *listingService, houseId));
+    }
 
     return results;
 }
@@ -310,28 +327,35 @@ AuctionSim::BuyQueueStatus AuctionSim::GetBuyQueueStatus(time_t now) const
 
 uint32 AuctionSim::CleanOverCapAuctions()
 {
-    if (!bot || !bot->GetPlayer() || !config)
+    if (!botPool || botPool->Empty() || !config)
     {
         return 0;
     }
 
-    ObjectGuid const botPlayerGUID = bot->GetPlayer()->GetGUID();
     auto trans = CharacterDatabase.BeginTransaction();
     uint32 removedCount = 0;
 
-    auto isOverCap = [this](AuctionEntry const* auction) {
-        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(auction->item_template);
-        if (!proto)
-        {
-            return false;  // can't judge it -- leave it alone
-        }
-        return !AuctionPricing::IsWithinLevelCap(
-            proto->RequiredLevel, proto->ItemLevel, config->maxRequiredLevel, config->maxItemLevel);
-    };
-
-    for (AuctionHouseId houseId : {AuctionHouseId::Alliance, AuctionHouseId::Horde})
+    for (AuctionHouseId houseId : ActiveHouses(config.get()))
     {
-        removedCount += RemoveBotAuctionsIf(houseId, botPlayerGUID, trans, isOverCap);
+        // Captures houseId (by value, fresh each iteration) so an item excluded
+        // from only one house doesn't get swept off every house it's listed on.
+        auto isOverCap = [this, houseId](AuctionEntry const* auction) {
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(auction->item_template);
+            if (!proto)
+            {
+                return false;  // can't judge it -- leave it alone
+            }
+            if (!AuctionPricing::IsWithinLevelCap(
+                    proto->RequiredLevel, proto->ItemLevel, config->maxRequiredLevel, config->maxItemLevel))
+            {
+                return true;
+            }
+            // Catches an item that was listed before a GM added it to
+            // AuctionSim.ItemExceptions for this house.
+            return config->IsItemExcludedFromHouse(auction->item_template, houseId);
+        };
+
+        removedCount += RemoveBotAuctionsIf(houseId, *botPool, trans, isOverCap);
     }
 
     CharacterDatabase.CommitTransaction(trans);
@@ -341,17 +365,16 @@ uint32 AuctionSim::CleanOverCapAuctions()
 
 void AuctionSim::DeleteAuctions()
 {
-    if (!bot || !bot->GetPlayer())
+    if (!botPool || botPool->Empty())
     {
         return;
     }
 
-    ObjectGuid const botPlayerGUID = bot->GetPlayer()->GetGUID();
     auto trans = CharacterDatabase.BeginTransaction();
 
-    for (AuctionHouseId houseId : {AuctionHouseId::Alliance, AuctionHouseId::Horde})
+    for (AuctionHouseId houseId : ActiveHouses(config.get()))
     {
-        RemoveBotAuctionsIf(houseId, botPlayerGUID, trans, [](AuctionEntry const*) { return true; });
+        RemoveBotAuctionsIf(houseId, *botPool, trans, [](AuctionEntry const*) { return true; });
     }
 
     CharacterDatabase.CommitTransaction(trans);

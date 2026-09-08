@@ -5,7 +5,7 @@
 
 class ASConfig;
 class AuctionListingService;
-class Bot;
+class BotPool;
 
 // Self-checks for the ".auctionsim test" GM command. Every test reports a clear
 // pass/fail rather than asserting/throwing, so a broken invariant is reported,
@@ -20,19 +20,19 @@ namespace AuctionSimTests
     };
 
     // Logic/data checks only -- no DB writes, no live auction house mutation.
-    std::vector<TestResult> RunLogicTests(Bot& bot, ASConfig const& config);
+    std::vector<TestResult> RunLogicTests(BotPool& botPool, ASConfig const& config);
 
     // End-to-end: lists one real temporary auction via the bot, verifies it appears
     // in the given house, then deletes it. Briefly mutates live game state.
     TestResult RunLiveListingTest(
-        Bot& bot, ASConfig const& config, AuctionListingService& listingService, AuctionHouseId houseId);
+        BotPool& botPool, ASConfig const& config, AuctionListingService& listingService, AuctionHouseId houseId);
 
     // End-to-end: lists one real temporary auction, forces it into a throwaway
     // AuctionBuyingService's queue as already due, processes the queue, and verifies
     // the auction was actually bought (removed from the house). Briefly mutates live
     // game state; does not touch the real bot's live buy queue.
     TestResult RunLiveBuyingTest(
-        Bot& bot, ASConfig const& config, AuctionListingService& listingService, AuctionHouseId houseId);
+        BotPool& botPool, ASConfig const& config, AuctionListingService& listingService, AuctionHouseId houseId);
 
     // End-to-end: verifies AuctionListingService::ListOneItem actually enforces the
     // level caps, not just that AuctionPricing::IsWithinLevelCap is correct in isolation.
@@ -41,5 +41,12 @@ namespace AuctionSimTests
     // when both are disabled; cleans up anything it lists. ASConfig& is non-const
     // specifically for this temporary override -- every other test only reads config.
     TestResult RunLiveLevelCapTest(
-        Bot& bot, ASConfig& config, AuctionListingService& listingService, AuctionHouseId houseId);
+        BotPool& botPool, ASConfig& config, AuctionListingService& listingService, AuctionHouseId houseId);
+
+    // End-to-end: same shape as RunLiveLevelCapTest, but for AuctionSim.ItemExceptions --
+    // temporarily bans a real candidate from `houseId`, confirms ListOneItem blocks it,
+    // then clears the ban (restoring any pre-existing entry) and confirms the same
+    // candidate lists normally again. Cleans up anything it lists.
+    TestResult RunLiveItemExceptionTest(
+        BotPool& botPool, ASConfig& config, AuctionListingService& listingService, AuctionHouseId houseId);
 }

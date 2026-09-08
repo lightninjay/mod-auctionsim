@@ -1,12 +1,13 @@
 #include "AuctionBuyingService.h"
 #include <algorithm>
 #include "AuctionPricing.h"
-#include "Bot.h"
+#include "ASConfig.h"
+#include "BotPool.h"
 #include "GameTime.h"
 #include "Log.h"
 #include "Mail.h"
 
-AuctionBuyingService::AuctionBuyingService(Bot& bot) : _bot(bot) {}
+AuctionBuyingService::AuctionBuyingService(BotPool& botPool, ASConfig const& config) : _botPool(botPool), _config(config) {}
 
 void AuctionBuyingService::RollTolerance() { _tolerance = AuctionPricing::RollBuyTolerance(); }
 
@@ -19,7 +20,8 @@ void AuctionBuyingService::ConsiderForPurchase(
     }
 
     time_t now = GameTime::GetGameTime().count();
-    uint32 remainingScans = AuctionPricing::CalculateRemainingScans(auction->expire_time - now);
+    uint32 remainingScans =
+        AuctionPricing::CalculateRemainingScans(auction->expire_time - now, _config.scanIntervalSeconds);
 
     if (!AuctionPricing::ShouldBuyAtPrice(pricePerItem, marketPrice, ceilingPrice, _tolerance, remainingScans))
     {
@@ -67,7 +69,9 @@ void AuctionBuyingService::BuyItem(AuctionEntry* auction, AuctionHouseId houseId
 {
     auto trans = CharacterDatabase.BeginTransaction();
 
-    auction->bidder = _bot.GetPlayerRef().GetGUID();
+    // Pick the buying character round-robin from the roster, same spreading
+    // rationale as the listing side.
+    auction->bidder = _botPool.NextPlayer().GetGUID();
     auction->bid = auction->buyout;
     sAuctionMgr->SendAuctionSuccessfulMail(auction, trans);
     auction->DeleteFromDB(trans);

@@ -1,10 +1,19 @@
 # Enable or disable the entire module
 AuctionSim.Enabled = 0
 
-# Bot account id
-AuctionSim.BotAccountID = 0
+# Bot character GUIDs, comma-separated (e.g. "12,45,201"). Each becomes an
+# active bot character. Combined with BotAccountIDs below into one roster.
+AuctionSim.BotCharacterIDs =
 
-# Bot character guid
+# Bot account ids, comma-separated. Every character on each listed account is
+# automatically added to the bot roster -- convenient for a dedicated "bot farm"
+# account with several toons instead of listing each character id by hand.
+AuctionSim.BotAccountIDs =
+
+# Deprecated single-character keys, kept only so an old auctionsim.conf still
+# starts up. If set, migrate them into BotCharacterIDs / BotAccountIDs above and
+# delete these two lines -- a future release may remove them.
+AuctionSim.BotAccountID = 0
 AuctionSim.BotCharacterID = 0
 
 # Do a scan on server startup
@@ -18,6 +27,30 @@ AuctionSim.MaxRequiredLevel = 0
 # Maximum item level for items the bot will list. Items above this item level
 # are skipped before being created. 0 disables this filter.
 AuctionSim.MaxItemLevel = 0
+
+# Explicit per-item, per-house auction house exceptions -- a manual override for
+# items the MaxRequiredLevel/MaxItemLevel filters above don't catch (e.g. a
+# low-level recipe or quest reward you still don't want auto-listed). Comma-
+# separated "itemId:bitmask" pairs; a banned item is simply never listed on the
+# matching house(s), and "Clean Over Cap" removes any of the bot's existing
+# auctions for it there too.
+#
+# Bitmask bits (add them together to ban from more than one house):
+#   1  Alliance auction house
+#   2  Horde auction house
+#   4  Neutral auction house (Booty Bay / Gadgetzan / Everlook)
+#
+# Example -- item 6661 (Savory Deviate Delight Recipe):
+#   6661:1   banned from Alliance only
+#   6661:2   banned from Horde only
+#   6661:3   banned from Alliance AND Horde (1+2)
+#   6661:4   banned from Neutral only
+#   6661:5   banned from Neutral and Alliance (4+1)
+#   6661:6   banned from Neutral and Horde (4+2)
+#   6661:7   banned from ALL THREE (1+2+4)
+#
+# AuctionSim.ItemExceptions = 6661:7,12345:2
+AuctionSim.ItemExceptions =
 
 # Per-category listing multiplier vs. the real market.
 #
@@ -52,3 +85,30 @@ AuctionSim.KeyPercent           = GREY: 0.1, WHITE: 0.1, GREEN: 0.1, BLUE: 0.1, 
 AuctionSim.PermanentPercent     = GREY: 0.1, WHITE: 0.1, GREEN: 0.1, BLUE: 0.1, PURPLE: 0.1, ORANGE: 0.1, YELLOW: 0.1
 AuctionSim.MiscPercent          = GREY: 0.1, WHITE: 0.1, GREEN: 0.1, BLUE: 0.1, PURPLE: 0.1, ORANGE: 0.1, YELLOW: 0.1
 AuctionSim.GlyphPercent         = GREY: 0.1, WHITE: 0.1, GREEN: 0.1, BLUE: 0.1, PURPLE: 0.1, ORANGE: 0.1, YELLOW: 0.1
+
+# Enable the Neutral (goblin) auction houses -- Booty Bay, Gadgetzan, Everlook.
+# Neutral-eligible items (see NeutralItems below) list on BOTH their native
+# Alliance/Horde house AND the Neutral house; they are never removed from their
+# native house. Everything else continues to list only on its native house.
+AuctionSim.EnableNeutralAH = 0
+
+# Comma-separated item_template ids that should also list on the Neutral house
+# -- typically faction-locked recipes/mounts/pets/reagents the opposing faction
+# can otherwise only get through a neutral auction house. Curated by you: item
+# faction/race flags aren't a reliable signal of "opposing-faction-only" in
+# 3.3.5a data, so this isn't auto-detected. Edited more conveniently via the
+# ahsim addon's drag-and-drop item pricer than by hand here.
+AuctionSim.NeutralItems =
+
+# How full the Neutral house is kept relative to its native house's observed
+# depth, since auctionsim.dat never scans a Neutral house directly (see
+# ASConfig::SynthesizeNeutralDepth). 1.0 would match the native house's target
+# fullness; keep this below 1 so Neutral stays a supplemental channel.
+AuctionSim.NeutralDepthScale = 0.5
+
+# How often the module rescans the auction houses and re-lists/re-considers
+# purchases, in minutes. Floored at 5 -- shorter risks the bot's own listing/
+# buying decisions racing a scan pass that's still being processed, and
+# needlessly hammers the auctionhouse tables. Default matches the old fixed
+# 60-minute cadence.
+AuctionSim.ScanIntervalMinutes = 60

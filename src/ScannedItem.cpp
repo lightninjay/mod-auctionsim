@@ -112,3 +112,46 @@ uint32 ScannedItem::GetTypicalListingCount() const
 {
     return FirstPositive({listing.adjMedian, listing.adjMean, listing.median, listing.mean}, 1);
 }
+
+ScannedItem ScannedItem::FromOverride(
+    uint8 factionNum,
+    uint32 itemID,
+    uint32 marketPrice,
+    uint32 listLow,
+    uint32 listHigh,
+    uint32 typicalStack,
+    uint32 stackLow,
+    uint32 stackHigh)
+{
+    ScannedItem item;
+    item.isOverride = true;
+    item.factionNum = factionNum;
+    item.itemID = itemID;
+    item.suffixID = 0;
+    item.sampleCount = 1;
+    item.listingSnapshotCount = 1;
+
+    // Price block: every getter reads adjMedian/adjLow/adjHigh/q3 first, with
+    // mean/median as fallback -- fill all of them from the same market price so
+    // no path falls through to 0.
+    item.price.mean = item.price.median = item.price.mode = marketPrice;
+    item.price.adjMean = item.price.adjMedian = item.price.adjMode = marketPrice;
+    item.price.low = item.price.q1 = item.price.adjLow = listLow;
+    item.price.high = item.price.q3 = item.price.adjHigh = listHigh;
+
+    // Stack block: same pattern, keyed off adjMode (typical) / adjLow / adjHigh.
+    item.stack.mean = item.stack.median = item.stack.mode = typicalStack;
+    item.stack.adjMean = item.stack.adjMedian = item.stack.adjMode = typicalStack;
+    item.stack.low = item.stack.adjLow = stackLow;
+    item.stack.high = item.stack.adjHigh = stackHigh;
+
+    // Listing-count block: no real snapshot data exists for a manually-priced
+    // item, so assume it typically carries one concurrent auction -- enough to
+    // let it be selected without artificially inflating its listing weight.
+    item.listing.mean = item.listing.median = item.listing.mode = 1;
+    item.listing.adjMean = item.listing.adjMedian = item.listing.adjMode = 1;
+    item.listing.low = item.listing.high = item.listing.q1 = item.listing.q3 = 1;
+    item.listing.adjLow = item.listing.adjHigh = 1;
+
+    return item;
+}

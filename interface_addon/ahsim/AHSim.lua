@@ -26,6 +26,9 @@ AHSim.OP = {
     CLEANOVERCAP = "CLEANOVERCAP",
     SHOWQUEUE = "SHOWQUEUE",
     SETBOTCHAR = "SETBOTCHAR",
+    ITEMQUERY = "ITEMQUERY",
+    ITEMPRICESET = "ITEMPRICESET",
+    ITEMSEARCH = "ITEMSEARCH",
     -- server -> client
     ERROR = "ERROR",
     CONFIG = "CONFIG",
@@ -37,10 +40,23 @@ AHSim.OP = {
     QUEUEINFO = "QUEUEINFO",
     CLEANRESULT = "CLEANRESULT",
     SETBOTCHARRESULT = "SETBOTCHARRESULT",
+    ITEMPRICE = "ITEMPRICE",
+    ITEMPRICESETRESULT = "ITEMPRICESETRESULT",
+    ITEMSEARCHRESULT = "ITEMSEARCHRESULT",
+    ITEMSEARCHDONE = "ITEMSEARCHDONE",
 }
 
+-- Multiple listeners per message type are supported (e.g. both the drag-drop
+-- Item Pricer window and the Price Search tab listen for ITEMPRICE / ITEMPRICE-
+-- SETRESULT); each holds its own currentItemId and ignores replies meant for
+-- the other.
 function AHSim:RegisterHandler(msgType, fn)
-    self.handlers[msgType] = fn
+    local list = self.handlers[msgType]
+    if not list then
+        list = {}
+        self.handlers[msgType] = list
+    end
+    list[#list + 1] = fn
 end
 
 function AHSim:Send(...)
@@ -73,9 +89,11 @@ function AHSim:Dispatch(message)
         return
     end
 
-    local handler = self.handlers[msgType]
-    if handler then
-        handler(unpack(fields, 2))
+    local list = self.handlers[msgType]
+    if list then
+        for i = 1, #list do
+            list[i](unpack(fields, 2))
+        end
     end
 end
 

@@ -315,21 +315,11 @@ function AHSim.ShowHelp()
     helpFrame:Raise()
 end
 
-function AHSim.BuildWindow()
-    if AHSimFrame then
-        return
-    end
-
-    AHSimDB = AHSimDB or {}
-
-    -- standalone dialog, not an AH tab
-    local frame = CreateModuleWindow(
-        "AHSimFrame", WINDOW_WIDTH, WINDOW_HEIGHT, TITLE_PREFIX .. "Bot Manager", "DIALOG")
-
-    -- everything below anchors inside `panel`, so window-chrome offsets stop here
-    local panel = CreateFrame("Frame", "AHSimPanel", frame)
-    panel:SetPoint("TOPLEFT", frame, "TOPLEFT", CONTENT_INSET, -TITLE_BAR_HEIGHT)
-    panel:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -CONTENT_INSET, CONTENT_INSET)
+-- Builds the original "Bot Manager" tab's contents into `panel` (a full-size
+-- content frame already anchored inside the window by BuildWindow). Split out
+-- of BuildWindow so BuildWindow can also build the "Price Search" tab and
+-- switch between the two.
+local function BuildBotManagerTab(panel)
 
     -- Results log: scrollable, full width along the bottom, shared by every action.
     local resultsBg = CreateFrame("Frame", nil, panel)
@@ -549,6 +539,79 @@ function AHSim.BuildWindow()
 
     y = y + 30
     content:SetSize(LABEL_COLUMN_WIDTH + #QUALITIES * COL_WIDTH + 20, y)
+end
+
+-- Tab defs are populated here (Bot Manager) and by other files loaded before
+-- BuildWindow ever runs (Price Search, from AHSimPriceSearchTab.lua) -- it only
+-- executes once the server confirms this character is a GM (see AHSimWindow.lua),
+-- by which point every addon file has loaded, so load order between the tab
+-- definitions doesn't matter.
+AHSim.tabDefs = AHSim.tabDefs or {}
+
+-- `build(panel)` populates a full-size content frame the first (and only) time
+-- its tab is built; `label` becomes the tab button's text.
+function AHSim.AddTab(label, build)
+    AHSim.tabDefs[#AHSim.tabDefs + 1] = { label = label, build = build }
+end
+
+AHSim.AddTab("Bot Manager", BuildBotManagerTab)
+
+function AHSim.BuildWindow()
+    if AHSimFrame then
+        return
+    end
+
+    AHSimDB = AHSimDB or {}
+
+    -- standalone dialog, not an AH tab
+    local frame = CreateModuleWindow(
+        "AHSimFrame", WINDOW_WIDTH, WINDOW_HEIGHT, TITLE_PREFIX .. "Bot Manager", "DIALOG")
+
+    local tabButtons, tabPanels = {}, {}
+
+    local function SelectTab(index)
+        for i, p in ipairs(tabPanels) do
+            if i == index then p:Show() else p:Hide() end
+        end
+        PanelTemplates_SetTab(frame, index)
+    end
+
+    for i, def in ipairs(AHSim.tabDefs) do
+        -- everything a tab builds anchors inside its own `panel`, so window-chrome
+        -- offsets stop here; all tab panels share the same rect and only one shows.
+        local panel = CreateFrame("Frame", "AHSimPanel" .. i, frame)
+        panel:SetPoint("TOPLEFT", frame, "TOPLEFT", CONTENT_INSET, -TITLE_BAR_HEIGHT)
+        panel:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -CONTENT_INSET, CONTENT_INSET)
+        panel:Hide()
+        tabPanels[i] = panel
+        def.build(panel)
+
+        -- Tabs hang off the window's bottom edge, Blizzard-style (CharacterFrame,
+        -- TradeSkillFrame, etc.); PanelTemplates_* expects them named
+        -- "<frame>Tab<i>", which CreateFrame's explicit name below satisfies.
+        local tab = CreateFrame("Button", "AHSimFrameTab" .. i, frame, "TabButtonTemplate")
+        tab:SetID(i)
+        tab:SetText(def.label)
+        PanelTemplates_TabResize(tab, 0)
+        if i == 1 then
+            tab:SetPoint("BOTTOMLEFT", frame, "TOPLEFT", 10, -8)
+        else
+            tab:SetPoint("TOPLEFT", tabButtons[i - 1], "TOPRIGHT", 0, 0)
+        end
+        tab:SetScript("OnClick", function(self)
+            SelectTab(self:GetID())
+            PlaySound("igCharacterInfoTab")
+        end)
+        tabButtons[i] = tab
+    end
+
+    PanelTemplates_SetNumTabs(frame, #AHSim.tabDefs)
+    SelectTab(1)
+
+    -- keep back-compat: AHSimPanel was the historical global name of tab 1's
+    -- content frame (used only as a scroll-anchor reference above; nothing
+    -- outside this file reads it, but keep the name stable regardless).
+    AHSimPanel = tabPanels[1]
 end
 
 AHSim:RegisterHandler(OP.CONFIG, function(key, value)

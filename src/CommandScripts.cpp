@@ -1,6 +1,8 @@
 #include <chrono>
 #include <utility>
+#include "ASConfig.h"
 #include "AuctionSim.h"
+#include "BotPool.h"
 #include "Chat.h"
 #include "ChatCommand.h"
 #include "GameTime.h"
@@ -47,6 +49,7 @@ public:
             {"test", HandleTestCommand, SEC_ADMINISTRATOR, Console::Yes},
             {"cleanovercap", HandleCleanOverCapCommand, SEC_ADMINISTRATOR, Console::Yes},
             {"showqueue", HandleShowQueueCommand, SEC_ADMINISTRATOR, Console::Yes},
+            {"status", HandleStatusCommand, SEC_ADMINISTRATOR, Console::Yes},
         };
         static ChatCommandTable commandTable = {
             {"auctionsim", auctionSimSubCommandTable},
@@ -62,9 +65,14 @@ public:
         }
 
         size_t queueSizeBefore = AuctionSim::instance()->GetBuyQueue().size();
-        long long elapsed = TimedMs([] {
+        bool neutralOn = AuctionSim::instance()->GetConfig() && AuctionSim::instance()->GetConfig()->enableNeutralAH;
+        long long elapsed = TimedMs([neutralOn] {
             AuctionSim::instance()->ScanAuctions(AuctionHouseId::Alliance);
             AuctionSim::instance()->ScanAuctions(AuctionHouseId::Horde);
+            if (neutralOn)
+            {
+                AuctionSim::instance()->ScanAuctions(AuctionHouseId::Neutral);
+            }
         });
         size_t queueSizeAfter = AuctionSim::instance()->GetBuyQueue().size();
 
@@ -132,6 +140,28 @@ public:
         long long elapsed = TimedMs([&] { removedCount = AuctionSim::instance()->CleanOverCapAuctions(); });
         handler->SendSysMessage(
             fmt::format("Removed {} over-cap auction(s) in {} ms", removedCount, elapsed));
+        return true;
+    }
+
+    static bool HandleStatusCommand(ChatHandler* handler)
+    {
+        if (!RequireEnabled(handler))
+        {
+            return true;
+        }
+
+        BotPool* pool = AuctionSim::instance()->GetBotPool();
+        ASConfig* config = AuctionSim::instance()->GetConfig();
+
+        std::string rosterMsg = (pool && !pool->Empty())
+            ? fmt::format("AuctionSim bot roster: {} character(s) active.", pool->Size())
+            : std::string("AuctionSim bot roster: no bot characters active.");
+        handler->SendSysMessage(rosterMsg);
+
+        std::string neutralMsg = (config && config->enableNeutralAH)
+            ? fmt::format("Neutral AH: enabled ({} item(s) configured).", config->neutralEligibleItems.size())
+            : std::string("Neutral AH: disabled.");
+        handler->SendSysMessage(neutralMsg);
         return true;
     }
 

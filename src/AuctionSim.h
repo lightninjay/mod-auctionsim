@@ -6,7 +6,7 @@
 #include "AuctionHouseMgr.h"
 #include "AuctionListingService.h"
 #include "AuctionSimTests.h"
-#include "Bot.h"
+#include "BotPool.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 
@@ -36,19 +36,25 @@ public:
     };
     BuyQueueStatus GetBuyQueueStatus(time_t now) const;
 
-    // GetBotPlayer() is non-null only while the bot runs. config is loaded at startup
+    // GetBotPlayer() is non-null only while the roster runs; picks round-robin
+    // across the roster (see BotPool::NextPlayer). config is loaded at startup
     // regardless of isEnabled, so GetConfig() is null only on a dat parse failure.
-    Player* GetBotPlayer() const { return bot ? bot->GetPlayer().get() : nullptr; }
+    Player* GetBotPlayer() const { return botPool && !botPool->Empty() ? &botPool->NextPlayer() : nullptr; }
     ASConfig* GetConfig() const { return config.get(); }
 
-    // Low GUID of the bot's character, or 0 when no bot is running. Cheap accessor
-    // for the mail hook -- reads the in-memory id, never re-parses config.
-    uint32 GetBotCharacterLowGuid() const { return bot ? bot->GetCharacterID() : 0; }
+    // Roster membership checks, replacing the old single-GUID equality checks.
+    // Used by the mail hook (low guid) and ownership filters (full GUID).
+    bool IsBotOwnedLowGuid(uint32 lowGuid) const { return botPool && botPool->OwnsLowGuid(lowGuid); }
+    bool IsBotOwned(ObjectGuid guid) const { return botPool && botPool->Owns(guid); }
 
-    // Starts the bot, or swaps it to the character in auctionsim.conf, with no
-    // restart. reloadConfig re-reads the .conf first (for values the addon just
-    // wrote). Returns false, leaving any running bot untouched, if config won't load
-    // or the configured ids don't resolve.
+    // The full roster, for services/tests that need to act through every bot
+    // character rather than just one.
+    BotPool* GetBotPool() const { return botPool.get(); }
+
+    // Starts the bot roster, or rebuilds it from the ids in auctionsim.conf, with
+    // no restart. reloadConfig re-reads the .conf first (for values the addon just
+    // wrote). Returns false, leaving any running roster untouched, if config won't
+    // load or none of the configured ids resolve.
     bool StartOrReloadBot(bool reloadConfig = true);
 
     bool isEnabled;
@@ -61,10 +67,10 @@ private:
     bool EnsureConfigFileExists();
 
     static AuctionSim* _instance;
-    std::unique_ptr<Bot> bot;
-    // Old bots kept alive rather than destroyed: the headless Player is only safe to
-    // tear down at shutdown.
-    std::vector<std::unique_ptr<Bot>> retiredBots;
+    std::unique_ptr<BotPool> botPool;
+    // Old rosters kept alive rather than destroyed: each headless Player is only
+    // safe to tear down at shutdown.
+    std::vector<std::unique_ptr<BotPool>> retiredBotPools;
     std::unique_ptr<ASConfig> config;
     std::unique_ptr<AuctionListingService> listingService;
     std::unique_ptr<AuctionBuyingService> buyingService;

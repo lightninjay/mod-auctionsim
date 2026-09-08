@@ -7,10 +7,11 @@
 #include "AuctionPricing.h"
 #include "DatabaseEnvFwd.h"
 
-class Bot;
+class ASConfig;
+class BotPool;
 
-// Owns the "buy" side of the bot: candidates found during a scan are queued,
-// then executed a few at a time as their rolled buy time comes due.
+// Owns the "buy" side of the bot roster: candidates found during a scan are
+// queued, then executed a few at a time as their rolled buy time comes due.
 class AuctionBuyingService
 {
 public:
@@ -20,7 +21,7 @@ public:
         time_t buyTime;
     };
 
-    explicit AuctionBuyingService(Bot& bot);
+    AuctionBuyingService(BotPool& botPool, ASConfig const& config);
 
     // Rolls a fresh buy-tolerance profile for the upcoming scan pass. Call once
     // per ScanAuctions() invocation, before any ConsiderForPurchase() calls.
@@ -40,6 +41,8 @@ public:
     void SortQueue();
 
     // Executes at most one due purchase from the queue. Safe to call every tick.
+    // The buying character is picked round-robin from the roster at purchase time
+    // (not at queue time), same as listing.
     void ProcessDueQueue();
 
     size_t QueueSize() const { return _queue.size(); }
@@ -56,7 +59,8 @@ public:
 private:
     void BuyItem(AuctionEntry* auction, AuctionHouseId houseId);
 
-    Bot& _bot;
+    BotPool& _botPool;
+    ASConfig const& _config;
     AuctionPricing::BuyTolerance _tolerance{};
     std::vector<QueuedPurchase> _queue;
     std::unordered_set<uint32> _queuedAuctionIds;

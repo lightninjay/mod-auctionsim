@@ -7,7 +7,7 @@
 #include "ItemTemplate.h"
 
 class ASConfig;
-class Bot;
+class BotPool;
 class ScannedItem;
 
 // Orchestrates creating new bot-owned AH listings for one house. Does not
@@ -15,7 +15,7 @@ class ScannedItem;
 class AuctionListingService
 {
 public:
-    AuctionListingService(Bot& bot, ASConfig const& config);
+    AuctionListingService(BotPool& botPool, ASConfig const& config);
 
     // existingCounts[itemClass][quality] = number of auctions of that class/quality
     // already on the house; itemAuctionCount[itemTemplateId] = number of auctions of
@@ -35,7 +35,9 @@ private:
     AuctionEntry* ListOneItem(
         ScannedItem const& scan, AuctionHouseId houseId, SQLTransaction<CharacterDatabaseConnection>& trans);
 
-    Bot& _bot;
+    // Each call picks the next roster character round-robin (BotPool::NextPlayer),
+    // so listings spread across every bot character instead of piling onto one.
+    BotPool& _botPool;
     ASConfig const& _config;
 
     // Per-item selection weights, reused across every (class, quality) pass of one

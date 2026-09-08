@@ -3,7 +3,7 @@
 #include "AuctionBuyingService.h"
 #include "AuctionListingService.h"
 #include "AuctionPricing.h"
-#include "Bot.h"
+#include "BotPool.h"
 #include "GameTime.h"
 #include "ObjectMgr.h"
 #include "ScannedItem.h"
@@ -23,17 +23,15 @@ namespace
         return {std::move(name), false, std::move(detail)};
     }
 
-    TestResult TestBotValid(Bot& bot)
+    TestResult TestBotValid(BotPool& botPool)
     {
-        if (!bot.GetSession())
+        if (botPool.Empty())
         {
-            return Fail("Bot session valid", "bot has no WorldSession");
+            return Fail("Bot roster valid", "roster has no bot characters");
         }
-        if (!bot.GetPlayer())
-        {
-            return Fail("Bot session valid", "bot has no Player");
-        }
-        return Pass("Bot session valid", Acore::StringFormat("player guid {}", bot.GetPlayer()->GetGUID().ToString()));
+        return Pass(
+            "Bot roster valid",
+            Acore::StringFormat("{} character(s), e.g. guid {}", botPool.Size(), botPool.NextPlayer().GetGUID().ToString()));
     }
 
     TestResult TestPriceDataLoaded(ASConfig const& config)
@@ -319,23 +317,23 @@ namespace
         return Pass("RollBuyTime bounds");
     }
 
-    TestResult TestCalculateRemainingScans()
+    TestResult TestCalculateRemainingScans(ASConfig const& config)
     {
-        uint32 interval = AuctionPricing::kScanIntervalSeconds;
+        uint32 interval = config.scanIntervalSeconds;
 
-        if (AuctionPricing::CalculateRemainingScans(0) != 1)
+        if (AuctionPricing::CalculateRemainingScans(0, interval) != 1)
         {
             return Fail("CalculateRemainingScans", "0 remaining seconds should be 1 scan");
         }
-        if (AuctionPricing::CalculateRemainingScans(-100) != 1)
+        if (AuctionPricing::CalculateRemainingScans(-100, interval) != 1)
         {
             return Fail("CalculateRemainingScans", "negative remaining seconds should be 1 scan");
         }
-        if (AuctionPricing::CalculateRemainingScans(static_cast<time_t>(interval)) != 1)
+        if (AuctionPricing::CalculateRemainingScans(static_cast<time_t>(interval), interval) != 1)
         {
             return Fail("CalculateRemainingScans", "exactly one interval should be 1 scan");
         }
-        if (AuctionPricing::CalculateRemainingScans(static_cast<time_t>(interval) + 1) != 2)
+        if (AuctionPricing::CalculateRemainingScans(static_cast<time_t>(interval) + 1, interval) != 2)
         {
             return Fail("CalculateRemainingScans", "one interval plus one second should round up to 2 scans");
         }
@@ -510,11 +508,11 @@ namespace
         return auction;
     }
 
-    TestResult TestBuyQueuePopulatesOnQualifyingPrice(Bot& bot)
+    TestResult TestBuyQueuePopulatesOnQualifyingPrice(BotPool& botPool, ASConfig const& config)
     {
         AuctionEntry* testAuction = MakeTestAuctionEntry(0xFFFFFFF0, GameTime::GetGameTime().count() + 100000);
 
-        AuctionBuyingService testService(bot);
+        AuctionBuyingService testService(botPool, config);
         testService.ConsiderForPurchase(testAuction, 1, 1'000'000, 2'000'000);  // always-buy: 1 <= mean
         bool ok = testService.QueueSize() == 1;
 
@@ -527,11 +525,11 @@ namespace
         return Pass("Buy queue populates on qualifying price");
     }
 
-    TestResult TestBuyQueueDedupesRescan(Bot& bot)
+    TestResult TestBuyQueueDedupesRescan(BotPool& botPool, ASConfig const& config)
     {
         AuctionEntry* testAuction = MakeTestAuctionEntry(0xFFFFFFF1, GameTime::GetGameTime().count() + 100000);
 
-        AuctionBuyingService testService(bot);
+        AuctionBuyingService testService(botPool, config);
         testService.ConsiderForPurchase(testAuction, 1, 1'000'000, 2'000'000);
         testService.ConsiderForPurchase(testAuction, 1, 1'000'000, 2'000'000);
         bool ok = testService.QueueSize() == 1;
@@ -545,12 +543,12 @@ namespace
         return Pass("Buy queue dedupes on rescan");
     }
 
-    TestResult TestBuyQueueNotYetDue(Bot& bot)
+    TestResult TestBuyQueueNotYetDue(BotPool& botPool, ASConfig const& config)
     {
         time_t now = GameTime::GetGameTime().count();
         AuctionEntry* testAuction = MakeTestAuctionEntry(0xFFFFFFF2, now + 100000);
 
-        AuctionBuyingService testService(bot);
+        AuctionBuyingService testService(botPool, config);
         testService.EnqueueForTest(testAuction, now + 10000);
         testService.ProcessDueQueue();
         bool ok = testService.QueueSize() == 1;
@@ -564,28 +562,32 @@ namespace
         return Pass("Buy queue leaves not-yet-due items alone");
     }
 
+    // Walks config's pooled ItemSelectionTable for houseId rather than filtering
+    // raw ScanData by faction tag -- ScanData rows are only ever tagged Alliance/
+    // Horde (auctionsim.dat never scans a Neutral house), so a Neutral candidate
+    // only exists in the pooled table (see ASConfig::BuildSelectionTables, which
+    // additionally files neutral-eligible items there).
     ScannedItem const* FindListableCandidate(ASConfig const& config, AuctionHouseId houseId)
     {
-        for (ScannedItem const& item : config.ScanData)
+        for (uint32 itemClass = 0; itemClass < MAX_ITEM_CLASS; ++itemClass)
         {
-            if (item.GetFactionNum() != static_cast<uint8>(houseId))
+            for (uint32 quality = 0; quality < MAX_ITEM_QUALITY; ++quality)
             {
-                continue;
+                for (ScannedItem const* item : config.ItemsFor(houseId, itemClass, quality))
+                {
+                    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item->GetItemID());
+                    if (!proto)
+                    {
+                        continue;
+                    }
+                    if (!AuctionPricing::IsWithinLevelCap(
+                            proto->RequiredLevel, proto->ItemLevel, config.maxRequiredLevel, config.maxItemLevel))
+                    {
+                        continue;
+                    }
+                    return item;
+                }
             }
-
-            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item.GetItemID());
-            if (!proto)
-            {
-                continue;
-            }
-
-            if (!AuctionPricing::IsWithinLevelCap(
-                    proto->RequiredLevel, proto->ItemLevel, config.maxRequiredLevel, config.maxItemLevel))
-            {
-                continue;
-            }
-
-            return &item;
         }
         return nullptr;
     }
@@ -598,24 +600,26 @@ namespace
     ScannedItem const* FindAnyResolvableCandidate(ASConfig const& config, AuctionHouseId houseId)
     {
         ScannedItem const* fallback = nullptr;
-        for (ScannedItem const& item : config.ScanData)
+        for (uint32 itemClass = 0; itemClass < MAX_ITEM_CLASS; ++itemClass)
         {
-            if (item.GetFactionNum() != static_cast<uint8>(houseId))
+            for (uint32 quality = 0; quality < MAX_ITEM_QUALITY; ++quality)
             {
-                continue;
-            }
-            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item.GetItemID());
-            if (!proto)
-            {
-                continue;
-            }
-            if (!fallback)
-            {
-                fallback = &item;
-            }
-            if (proto->RequiredLevel > 1 && proto->ItemLevel > 1)
-            {
-                return &item;
+                for (ScannedItem const* item : config.ItemsFor(houseId, itemClass, quality))
+                {
+                    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item->GetItemID());
+                    if (!proto)
+                    {
+                        continue;
+                    }
+                    if (!fallback)
+                    {
+                        fallback = item;
+                    }
+                    if (proto->RequiredLevel > 1 && proto->ItemLevel > 1)
+                    {
+                        return item;
+                    }
+                }
             }
         }
         return fallback;
@@ -629,14 +633,25 @@ namespace
         sAuctionMgr->GetAuctionsMapByHouseId(houseId)->RemoveAuction(auction);
         CharacterDatabase.CommitTransaction(trans);
     }
+
+    char const* HouseName(AuctionHouseId houseId)
+    {
+        switch (houseId)
+        {
+            case AuctionHouseId::Alliance: return "Alliance";
+            case AuctionHouseId::Horde: return "Horde";
+            case AuctionHouseId::Neutral: return "Neutral";
+            default: return "Unknown";
+        }
+    }
 }
 
 namespace AuctionSimTests
 {
-    std::vector<TestResult> RunLogicTests(Bot& bot, ASConfig const& config)
+    std::vector<TestResult> RunLogicTests(BotPool& botPool, ASConfig const& config)
     {
         return {
-            TestBotValid(bot),
+            TestBotValid(botPool),
             TestPriceDataLoaded(config),
             TestBothFactionsHavePriceData(config),
             TestListingMasksConfigured(config),
@@ -650,27 +665,27 @@ namespace AuctionSimTests
             TestRollBuyToleranceBounds(),
             TestShouldBuyAtPriceBoundaries(),
             TestRollBuyTimeBounds(),
-            TestCalculateRemainingScans(),
+            TestCalculateRemainingScans(config),
             TestListingCountMath(),
             TestWeightedPick(),
             TestIsWithinLevelCapBoundary(),
             TestIsWithinVendorBuyPriceBoundary(),
             TestIsBuyableQuality(),
-            TestBuyQueuePopulatesOnQualifyingPrice(bot),
-            TestBuyQueueDedupesRescan(bot),
-            TestBuyQueueNotYetDue(bot),
+            TestBuyQueuePopulatesOnQualifyingPrice(botPool, config),
+            TestBuyQueueDedupesRescan(botPool, config),
+            TestBuyQueueNotYetDue(botPool, config),
         };
     }
 
     TestResult RunLiveListingTest(
-        Bot& bot, ASConfig const& config, AuctionListingService& listingService, AuctionHouseId houseId)
+        BotPool& botPool, ASConfig const& config, AuctionListingService& listingService, AuctionHouseId houseId)
     {
-        char const* houseName = houseId == AuctionHouseId::Alliance ? "Alliance" : "Horde";
+        char const* houseName = HouseName(houseId);
         std::string name = Acore::StringFormat("Live listing round-trip ({})", houseName);
 
-        if (!bot.GetPlayer())
+        if (botPool.Empty())
         {
-            return Fail(name, "bot has no Player");
+            return Fail(name, "bot roster is empty");
         }
 
         ScannedItem const* candidate = FindListableCandidate(config, houseId);
@@ -711,14 +726,14 @@ namespace AuctionSimTests
     }
 
     TestResult RunLiveBuyingTest(
-        Bot& bot, ASConfig const& config, AuctionListingService& listingService, AuctionHouseId houseId)
+        BotPool& botPool, ASConfig const& config, AuctionListingService& listingService, AuctionHouseId houseId)
     {
-        char const* houseName = houseId == AuctionHouseId::Alliance ? "Alliance" : "Horde";
+        char const* houseName = HouseName(houseId);
         std::string name = Acore::StringFormat("Live buying round-trip ({})", houseName);
 
-        if (!bot.GetPlayer())
+        if (botPool.Empty())
         {
-            return Fail(name, "bot has no Player");
+            return Fail(name, "bot roster is empty");
         }
 
         ScannedItem const* candidate = FindListableCandidate(config, houseId);
@@ -735,7 +750,7 @@ namespace AuctionSimTests
         uint32 auctionId = auction->Id;
 
         // Throwaway service so this never touches the real bot's live buy queue.
-        AuctionBuyingService testService(bot);
+        AuctionBuyingService testService(botPool, config);
         testService.EnqueueForTest(auction, GameTime::GetGameTime().count() - 1);  // already due
         testService.ProcessDueQueue();
 
@@ -760,14 +775,14 @@ namespace AuctionSimTests
     }
 
     TestResult RunLiveLevelCapTest(
-        Bot& bot, ASConfig& config, AuctionListingService& listingService, AuctionHouseId houseId)
+        BotPool& botPool, ASConfig& config, AuctionListingService& listingService, AuctionHouseId houseId)
     {
-        char const* houseName = houseId == AuctionHouseId::Alliance ? "Alliance" : "Horde";
+        char const* houseName = HouseName(houseId);
         std::string name = Acore::StringFormat("Level cap enforcement ({})", houseName);
 
-        if (!bot.GetPlayer())
+        if (botPool.Empty())
         {
-            return Fail(name, "bot has no Player");
+            return Fail(name, "bot roster is empty");
         }
 
         ScannedItem const* candidate = FindAnyResolvableCandidate(config, houseId);
@@ -845,5 +860,74 @@ namespace AuctionSimTests
                 candidate->GetItemID(),
                 proto->RequiredLevel,
                 proto->ItemLevel));
+    }
+
+    TestResult RunLiveItemExceptionTest(
+        BotPool& botPool, ASConfig& config, AuctionListingService& listingService, AuctionHouseId houseId)
+    {
+        char const* houseName = HouseName(houseId);
+        std::string name = Acore::StringFormat("Item exception enforcement ({})", houseName);
+
+        if (botPool.Empty())
+        {
+            return Fail(name, "bot roster is empty");
+        }
+
+        ScannedItem const* candidate = FindListableCandidate(config, houseId);
+        if (!candidate)
+        {
+            return Fail(name, "no usable price data entry found for this house");
+        }
+        uint32 itemId = candidate->GetItemID();
+
+        // AuctionSim.ItemExceptions may already have an entry for this item (unlikely
+        // for a randomly-found candidate, but restore it exactly either way).
+        bool hadExisting = config.itemHouseExceptions.count(itemId) > 0;
+        uint8 savedMask = hadExisting ? config.itemHouseExceptions[itemId] : 0;
+
+        uint8 houseBit = 0;
+        switch (houseId)
+        {
+            case AuctionHouseId::Alliance: houseBit = 1; break;
+            case AuctionHouseId::Horde: houseBit = 2; break;
+            case AuctionHouseId::Neutral: houseBit = 4; break;
+            default: break;
+        }
+
+        // Banning the candidate from this specific house must block the listing...
+        config.itemHouseExceptions[itemId] = houseBit;
+        AuctionEntry* blocked = listingService.ListTestItem(*candidate, houseId);
+        bool exceptionBlocksListing = blocked == nullptr;
+        if (blocked)
+        {
+            CleanUpTestAuction(blocked, houseId);
+        }
+
+        // ...but clearing it must let the same candidate list normally again.
+        if (hadExisting)
+        {
+            config.itemHouseExceptions[itemId] = savedMask;
+        }
+        else
+        {
+            config.itemHouseExceptions.erase(itemId);
+        }
+        AuctionEntry* allowed = listingService.ListTestItem(*candidate, houseId);
+        if (allowed)
+        {
+            CleanUpTestAuction(allowed, houseId);
+        }
+
+        if (!exceptionBlocksListing)
+        {
+            return Fail(name, "an ItemExceptions entry for this house did not block listing");
+        }
+        if (!allowed)
+        {
+            return Fail(name, "the item was not listed once the exception was cleared");
+        }
+
+        return Pass(
+            name, Acore::StringFormat("item {} correctly blocked while excepted and allowed once cleared", itemId));
     }
 }

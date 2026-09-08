@@ -8,8 +8,10 @@
 // AuctionHouseMgr dependency, so this can be exercised with plain values.
 namespace AuctionPricing
 {
-    // Fixed scan cadence -- previously user-configurable via AuctionSim.UpdateInterval.
-    constexpr uint32 kScanIntervalSeconds = 3600;
+    // Default scan cadence, used only when AuctionSim.ScanIntervalMinutes is unset.
+    // Runtime cadence lives on ASConfig::scanIntervalSeconds -- see
+    // AuctionSim.ScanIntervalMinutes in auctionsim.conf.dist (5-minute floor).
+    constexpr uint32 kDefaultScanIntervalSeconds = 3600;
 
     // How full to make a (class, quality) category this scan: a random point in
     // the observed [q1, median] band. Kept toward the lower end on purpose --
@@ -57,7 +59,10 @@ namespace AuctionPricing
 
     // How many more scans (at the fixed interval) will see this auction before it
     // expires. Always >= 1.
-    uint32 CalculateRemainingScans(time_t remainingSeconds);
+    // scanIntervalSeconds is the live-configured cadence (ASConfig::scanIntervalSeconds),
+    // not the kDefaultScanIntervalSeconds constant -- callers must pass the real value
+    // so this estimate matches how often ScanAuctions() actually runs.
+    uint32 CalculateRemainingScans(time_t remainingSeconds, uint32 scanIntervalSeconds);
 
     // True if a purchase should be made now. Always buys at/under marketPrice (the
     // robust typical price); never buys above ceilingPrice (the 75th percentile);

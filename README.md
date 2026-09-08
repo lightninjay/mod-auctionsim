@@ -9,6 +9,7 @@ Every hour (fixed, not configurable), AuctionSim scans both auction houses:
 - **Listing**: it keeps each item class/quality bucket about as full as a real auction house was observed to be in the scan data -- topping a bucket up only once it drops below the observed lower quartile, and choosing which items fill it weighted by how often each was really listed. A per-bucket multiplier in the config scales that target up or down. New listings get a random quantity and a buyout price rolled around the item's known mean price.
 - **Buying**: for each auction it doesn't already own, if the price is at or under the item's known mean, it's always queued to buy. If the price is above mean but still under the item's known maximum, it's queued with some probability (randomized each scan, to mimic natural demand variance between real players) rather than always or never. Queued purchases execute within 45 minutes of being queued.
 - Optional `MaxRequiredLevel`/`MaxItemLevel` caps stop it from listing gear above your realm's level, for progression servers running below the max level.
+- `ItemExceptions` lets you explicitly ban specific items from specific auction houses (by item id + a per-house bitmask), for the odd item those level caps don't catch.
 
 ## Installation
 
