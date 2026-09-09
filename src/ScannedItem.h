@@ -111,6 +111,13 @@ public:
     // from the same handful of inputs, so every getter above still returns sane
     // values. sampleCount/listingSnapshotCount are set to 1 (present but
     // low-confidence, never treated as "no data").
+    // markAsOverride distinguishes a GM-confirmed price (true, the default -- what
+    // the Item Pricer/Price Search tab create; IsOverride() reports true, and
+    // ASConfig::WriteOverridesFile persists it) from a server-synthesized
+    // placeholder (false -- what ASConfig uses to auto-price an AuctionSim.NeutralItems
+    // entry that has no real scan/GM data yet, so it can list something reasonable
+    // without silently promoting an unconfirmed guess into the persisted overrides
+    // file the next time any unrelated item gets saved).
     static ScannedItem FromOverride(
         uint8 factionNum,
         uint32 itemID,
@@ -119,7 +126,8 @@ public:
         uint32 listHigh,
         uint32 typicalStack,
         uint32 stackLow,
-        uint32 stackHigh);
+        uint32 stackHigh,
+        bool markAsOverride = true);
 
     // Parses kRowFields-field auctionsim.dat item row. std::nullopt if malformed.
     static std::optional<ScannedItem> TryParse(std::string_view dataLine);

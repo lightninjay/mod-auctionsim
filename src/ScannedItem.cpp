@@ -121,10 +121,11 @@ ScannedItem ScannedItem::FromOverride(
     uint32 listHigh,
     uint32 typicalStack,
     uint32 stackLow,
-    uint32 stackHigh)
+    uint32 stackHigh,
+    bool markAsOverride)
 {
     ScannedItem item;
-    item.isOverride = true;
+    item.isOverride = markAsOverride;
     item.factionNum = factionNum;
     item.itemID = itemID;
     item.suffixID = 0;

@@ -52,6 +52,21 @@ AuctionSim.MaxItemLevel = 0
 # AuctionSim.ItemExceptions = 6661:7,12345:2
 AuctionSim.ItemExceptions =
 
+# For large curated exclusion lists (hundreds/thousands of ids) that would be
+# unwieldy as a single inline config line above -- e.g. a full TBC item dump
+# and a full WotLK item dump kept as two separate files. Comma-separated
+# filenames, resolved relative to the SAME directory auctionsim.dat lives in
+# (the module's config folder -- wherever auctionsim.dat was copied to at
+# build time), so just drop the files there and list their names here.
+#
+# Each file is one entry per line: either a bare item id (which means
+# "excluded from all three houses", the natural default for a flat dump list)
+# or "itemId:mask" using the same 1/2/4 bitmask as above for per-house control
+# within the file. Blank lines and lines starting with # are ignored.
+#
+# AuctionSim.ItemExceptionFiles = tbc_exclusions.txt,wotlk_exclusions.txt
+AuctionSim.ItemExceptionFiles =
+
 # Per-category listing multiplier vs. the real market.
 #
 # The bot decides how full to keep each (category, quality) from real Auctioneer

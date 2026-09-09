@@ -97,6 +97,17 @@ public:
     std::unordered_map<uint32, ScannedItem const*> ByItemId;
     ScannedItem const* FindAnyScan(uint32 itemId) const;
 
+    // (itemID, houseID) -> that item's row on that specific house, independent of
+    // class/quality -- for the Price Search tab, which needs to show/edit
+    // Alliance, Horde, and Neutral prices for the same item side by side rather
+    // than the single "whichever house's row we saw first" ByItemId answer.
+    ScannedItem const* FindHouseScan(uint32 itemId, AuctionHouseId houseId) const;
+
+    // Item ids with at least one row in ByItemId -- built in BuildSelectionTables,
+    // refreshed incrementally by SetHouseOverride/ClearHouseOverride/UpsertOverride
+    // so a freshly-priced item is reflected immediately without a restart.
+    std::vector<uint32> const& SearchableItemIds() const { return searchableItemIds; }
+
     // Adds or replaces a GM-entered price for one item (see ScannedItem::FromOverride),
     // filing it into ScanData/ItemSelectionTable/ItemIndex/ByItemId exactly like a
     // real scanned row, and persists it to auctionsim_overrides.dat so it survives a
@@ -113,6 +124,30 @@ public:
         uint32 stackLow,
         uint32 stackHigh,
         bool neutralEligible);
+
+    // Direct per-house price editing for the Price Search tab -- unlike
+    // UpsertOverride (which guesses Alliance/Horde from the item's race
+    // restriction and treats Neutral as a single yes/no flag), these act on
+    // exactly one house at a time with no guessing, so a GM can set an
+    // Alliance-only price, override just the Neutral listing, or intentionally
+    // price something its race restriction wouldn't naturally suggest. Both
+    // persist to the same auctionsim_overrides.dat as UpsertOverride and take
+    // effect immediately (no restart, no rescan needed). Note this does not
+    // itself check IsItemExcludedFromHouse -- that's enforced where an override
+    // row actually gets turned into a real auction (AuctionListingService::
+    // ListOneItem), same as it is for a real scanned row, so an exclusion still
+    // wins even over a saved override; a GM can save a price for an excluded
+    // item/house and it will simply never list.
+    bool SetHouseOverride(
+        uint32 itemId,
+        AuctionHouseId houseId,
+        uint32 marketPrice,
+        uint32 listLow,
+        uint32 listHigh,
+        uint32 typicalStack,
+        uint32 stackLow,
+        uint32 stackHigh);
+    bool ClearHouseOverride(uint32 itemId, AuctionHouseId houseId);
 
     // Per-(itemClass, quality) listing multiplier vs. the real market, from the
     // AuctionSim.<Class>Percent config lines. Plain decimals (1, 1.5, 0.25, 0).
@@ -175,7 +210,25 @@ private:
     void LoadNeutralConfig();
     void SynthesizeNeutralDepth();
     void LoadOverrides();
-    void LoadItemExceptions();
+    // datFilePath is auctionsim.dat's own path -- passed through so file-based
+    // exception lists (AuctionSim.ItemExceptionFiles) resolve relative to the
+    // same directory auctionsim.dat lives in (the module's config folder),
+    // exactly like overridesFilePath does, rather than needing a separate path
+    // setting of their own.
+    void LoadItemExceptions(std::string const& datFilePath);
+
+    // Fixes a gap where an AuctionSim.NeutralItems entry with no real scan data
+    // and no GM-confirmed override (the common case -- it's meant for faction-
+    // exclusive/rare items, which by nature rarely show up in a scanned economy)
+    // never got filed into the Neutral bucket at all, silently listing nothing
+    // for it forever (BuildSelectionTables only iterates ScanData, i.e. real
+    // scan rows). Runs once at config load, after LoadOverrides -- for every
+    // AuctionSim.NeutralItems id that still has no Neutral-house row, auto-prices
+    // it via ItemPriceSuggestion and files it as a non-persisted row (see
+    // ScannedItem::FromOverride's markAsOverride) so it can list without ever
+    // being silently written into auctionsim_overrides.dat as if a GM had
+    // confirmed it.
+    void SynthesizeMissingNeutralItems();
 
     // Overrides persist next to auctionsim.dat as auctionsim_overrides.dat, one
     // "itemId:faction:marketPrice:listLow:listHigh:typicalStack:stackLow:stackHigh:neutralEligible"
@@ -184,6 +237,39 @@ private:
     // would otherwise be silently lost on the next scan-data refresh.
     std::string overridesFilePath;
     bool WriteOverridesFile() const;
+
+    // (itemID << 8 | houseID) -> row, backing FindHouseScan. houseID fits in a
+    // byte (max observed value is Neutral=7), so this packing never collides.
+    std::unordered_map<uint64_t, ScannedItem const*> ByItemHouse;
+    static uint64_t ItemHouseKey(uint32 itemId, AuctionHouseId houseId)
+    {
+        return (static_cast<uint64_t>(itemId) << 8) | static_cast<uint64_t>(houseId);
+    }
+
+    std::vector<uint32> searchableItemIds;
+    void RebuildSearchableItemIds();
+
+    // Removes any existing override row for exactly (itemId, houseId) -- a
+    // different house's row for the same item is left untouched.
+    void RemoveOrphanedOverrideRow(uint32 itemId, AuctionHouseId houseId);
+
+    // Shared by SetHouseOverride and UpsertOverride: builds and files one override
+    // row for (itemId, houseId), replacing any existing row for that exact pair
+    // (a different house's row for the same item is untouched). Does not persist
+    // to disk -- callers batch several of these per GM action, then call
+    // WriteOverridesFile() once. persist=false (used only by
+    // SynthesizeMissingNeutralItems) marks the row as a non-GM-confirmed
+    // placeholder so WriteOverridesFile never picks it up.
+    bool FileHouseOverrideRow(
+        uint32 itemId,
+        AuctionHouseId houseId,
+        uint32 marketPrice,
+        uint32 listLow,
+        uint32 listHigh,
+        uint32 typicalStack,
+        uint32 stackLow,
+        uint32 stackHigh,
+        bool persist = true);
 
     void UnpackQualityString(std::string_view qualityString, int itemClass);
 };

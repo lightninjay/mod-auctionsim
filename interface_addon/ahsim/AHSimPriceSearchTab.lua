@@ -6,11 +6,14 @@
 --
 -- Searching sends OP.ITEMSEARCH; the server replies with up to twenty
 -- OP.ITEMSEARCHRESULT rows (itemId, name, quality) followed by one
--- OP.ITEMSEARCHDONE (shown, total). Selecting a result reuses the same
--- OP.ITEMQUERY / OP.ITEMPRICE / OP.ITEMPRICESET protocol as the drag-and-drop
--- pricer, so a GM can look up what AuctionSim would list an item at and tune
--- it the same way. The min/max fields it shows (per-unit price and stack size)
--- are literally the low/high band the bot rolls a new listing from -- see
+-- OP.ITEMSEARCHDONE (shown, total). Selecting a result sends OP.ITEMQUERY (for
+-- an initial suggested/existing price to prefill the fields with) and
+-- OP.ITEMHOUSEQUERY (for the Alliance/Horde/Neutral status shown next to the
+-- house selector). Save/Remove act on whichever house is selected via
+-- OP.ITEMHOUSESET / OP.ITEMHOUSECLEAR -- independent per-house pricing, not the
+-- single race-guessed price the drag-and-drop pricer's OP.ITEMPRICESET still
+-- uses. The min/max fields it shows (per-unit price and stack size) are
+-- literally the low/high band the bot rolls a new listing from -- see
 -- ScannedItem::GetListLow/GetListHigh and GetStackLow/GetStackHigh -- shown
 -- here as two side-by-side "Minimum listing" / "Maximum listing" columns so
 -- that band can be tuned as a whole for one item.
@@ -206,31 +209,78 @@ function AHSim.BuildPriceSearchTab(panel)
 
     local stackTypicalBox = MakeFieldRow(minCol, -92, "Typical stack", FIELD_WIDTH)
 
-    local neutralCheck = CreateFrame("CheckButton", nil, maxCol, "UICheckButtonTemplate")
-    neutralCheck:SetSize(22, 22)
-    neutralCheck:SetPoint("TOPLEFT", maxCol, "TOPLEFT", -2, -92 - 16)
-    local neutralLabel = fields:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    neutralLabel:SetPoint("LEFT", neutralCheck, "RIGHT", 2, 0)
-    neutralLabel:SetText("Also list on Neutral AH")
+    -- House selector: which of Alliance/Horde/Neutral Save/Clear act on. Replaces
+    -- the old single "Also list on Neutral AH" checkbox -- with per-house editing,
+    -- Alliance and Horde can now be priced independently too, not just guessed
+    -- from the item's race restriction.
+    local HOUSE_ALLIANCE, HOUSE_HORDE, HOUSE_NEUTRAL = 2, 6, 7
+    local HOUSE_NAMES = { [HOUSE_ALLIANCE] = "Alliance", [HOUSE_HORDE] = "Horde", [HOUSE_NEUTRAL] = "Neutral" }
+
+    local houseRow = CreateFrame("Frame", nil, maxCol)
+    houseRow:SetPoint("TOPLEFT", maxCol, "TOPLEFT", -2, -92 - 16)
+    houseRow:SetSize(FIELD_WIDTH * 2 + colGap, 20)
+
+    local houseButtons = {}
+    local houseStatusTexts = {}
+    local houseButtonX = 0
+    for _, houseId in ipairs({ HOUSE_ALLIANCE, HOUSE_HORDE, HOUSE_NEUTRAL }) do
+        local btn = CreateFrame("CheckButton", nil, houseRow, "UIRadioButtonTemplate")
+        btn:SetPoint("TOPLEFT", houseRow, "TOPLEFT", houseButtonX, 0)
+        local label = houseRow:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+        label:SetPoint("LEFT", btn, "RIGHT", 2, 0)
+        label:SetText(HOUSE_NAMES[houseId])
+        btn.houseId = houseId
+        houseButtons[houseId] = btn
+
+        local status = houseRow:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+        status:SetPoint("TOP", btn, "BOTTOM", 10, -2)
+        houseStatusTexts[houseId] = status
+
+        houseButtonX = houseButtonX + 100
+    end
 
     local saveButton = CreateFrame("Button", nil, detail, "UIPanelButtonTemplate")
-    saveButton:SetSize(120, 22)
-    saveButton:SetPoint("TOPLEFT", minCol, "BOTTOMLEFT", 0, -92 - 30)
+    saveButton:SetSize(90, 22)
+    saveButton:SetPoint("TOPLEFT", minCol, "BOTTOMLEFT", 0, -92 - 46)
     saveButton:SetText("Save price")
 
+    local clearButton = CreateFrame("Button", nil, detail, "UIPanelButtonTemplate")
+    clearButton:SetSize(90, 22)
+    clearButton:SetPoint("LEFT", saveButton, "RIGHT", 6, 0)
+    clearButton:SetText("Remove")
+
     local statusText = detail:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    statusText:SetPoint("LEFT", saveButton, "RIGHT", 10, 0)
+    statusText:SetPoint("LEFT", clearButton, "RIGHT", 10, 0)
 
     detail.currentItemId = nil
+    detail.selectedHouse = nil
+
+    local function SelectHouse(houseId)
+        detail.selectedHouse = houseId
+        for id, btn in pairs(houseButtons) do
+            btn:SetChecked(id == houseId)
+        end
+    end
+    for houseId, btn in pairs(houseButtons) do
+        btn:SetScript("OnClick", function() SelectHouse(houseId) end)
+    end
 
     local function RequestPriceFor(itemId, displayName)
         detail.currentItemId = itemId
+        detail.selectedHouse = nil
+        for _, btn in pairs(houseButtons) do
+            btn:SetChecked(false)
+        end
+        for _, status in pairs(houseStatusTexts) do
+            status:SetText("...")
+        end
         icon:SetTexture(GetItemIcon(itemId) or "Interface\\Icons\\INV_Misc_QuestionMark")
         nameText:SetText(displayName or ("item:" .. itemId))
         sourceText:SetText("")
         basisText:SetText("querying server...")
         statusText:SetText("")
         AHSim:Send(OP.ITEMQUERY, itemId)
+        AHSim:Send(OP.ITEMHOUSEQUERY, itemId)
     end
 
     -- ===== Search wiring =====
@@ -314,14 +364,43 @@ function AHSim.BuildPriceSearchTab(panel)
             stackTypicalBox:SetText(typicalStack or 1)
             stackLowBox:SetText(stackLow or 1)
             stackHighBox:SetText(stackHigh or 1)
-            neutralCheck:SetChecked(tonumber(neutralEligible) == 1)
             sourceText:SetText(SOURCE_LABEL[source] or source or "")
             basisText:SetText(basis or "")
         end)
 
+    -- ===== Per-house status (Alliance/Horde/Neutral at a glance) =====
+    AHSim:RegisterHandler(OP.ITEMHOUSEQUERYRESULT, function(itemId, aHas, aMarket, hHas, hMarket, nHas, nMarket)
+        if tonumber(itemId) ~= detail.currentItemId then
+            return
+        end
+        local byHouse = {
+            [HOUSE_ALLIANCE] = { tonumber(aHas) == 1, tonumber(aMarket) },
+            [HOUSE_HORDE] = { tonumber(hHas) == 1, tonumber(hMarket) },
+            [HOUSE_NEUTRAL] = { tonumber(nHas) == 1, tonumber(nMarket) },
+        }
+        local firstListed = nil
+        for houseId, info in pairs(byHouse) do
+            local has, market = info[1], info[2]
+            if has then
+                houseStatusTexts[houseId]:SetText(sformat("|cff40ff40%d|r", market))
+                firstListed = firstListed or houseId
+            else
+                houseStatusTexts[houseId]:SetText("|cff888888--|r")
+            end
+        end
+        -- Default the house selector to whichever house is already listed, so
+        -- Save/Clear act on something sensible without the GM having to think
+        -- about it first; falls back to Alliance if the item isn't listed anywhere.
+        SelectHouse(firstListed or HOUSE_ALLIANCE)
+    end)
+
     saveButton:SetScript("OnClick", function()
         if not detail.currentItemId then
             statusText:SetText("|cffff4040Pick a result first.|r")
+            return
+        end
+        if not detail.selectedHouse then
+            statusText:SetText("|cffff4040Pick a house (Alliance/Horde/Neutral) first.|r")
             return
         end
         local market = tonumber(marketBox:GetText()) or 0
@@ -330,22 +409,33 @@ function AHSim.BuildPriceSearchTab(panel)
             return
         end
         AHSim:Send(
-            OP.ITEMPRICESET,
+            OP.ITEMHOUSESET,
             detail.currentItemId,
+            detail.selectedHouse,
             market,
             tonumber(listLowBox:GetText()) or market,
             tonumber(listHighBox:GetText()) or market,
             tonumber(stackTypicalBox:GetText()) or 1,
             tonumber(stackLowBox:GetText()) or 1,
-            tonumber(stackHighBox:GetText()) or 1,
-            neutralCheck:GetChecked() and 1 or 0)
+            tonumber(stackHighBox:GetText()) or 1)
         statusText:SetText("saving...")
     end)
 
-    AHSim:RegisterHandler(OP.ITEMPRICESETRESULT, function(status, detailMsg)
-        -- Both tabs' Save buttons trigger the same reply; only speak up if this
-        -- tab actually has a selection (the drag-drop pricer shows its own status).
+    clearButton:SetScript("OnClick", function()
         if not detail.currentItemId then
+            statusText:SetText("|cffff4040Pick a result first.|r")
+            return
+        end
+        if not detail.selectedHouse then
+            statusText:SetText("|cffff4040Pick a house (Alliance/Horde/Neutral) first.|r")
+            return
+        end
+        AHSim:Send(OP.ITEMHOUSECLEAR, detail.currentItemId, detail.selectedHouse)
+        statusText:SetText("removing...")
+    end)
+
+    AHSim:RegisterHandler(OP.ITEMHOUSESETRESULT, function(status, itemId, houseId, detailMsg)
+        if tonumber(itemId) ~= detail.currentItemId then
             return
         end
         if status == "ok" then
@@ -353,6 +443,19 @@ function AHSim.BuildPriceSearchTab(panel)
         else
             statusText:SetText("|cffff4040Save failed: " .. (detailMsg or "unknown error") .. "|r")
         end
+        AHSim:Send(OP.ITEMHOUSEQUERY, detail.currentItemId)
+    end)
+
+    AHSim:RegisterHandler(OP.ITEMHOUSECLEARRESULT, function(status, itemId, houseId, detailMsg)
+        if tonumber(itemId) ~= detail.currentItemId then
+            return
+        end
+        if status == "ok" then
+            statusText:SetText("|cff40ff40Removed.|r")
+        else
+            statusText:SetText("|cffff4040Remove failed: " .. (detailMsg or "unknown error") .. "|r")
+        end
+        AHSim:Send(OP.ITEMHOUSEQUERY, detail.currentItemId)
     end)
 end
 

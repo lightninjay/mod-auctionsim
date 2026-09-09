@@ -51,6 +51,9 @@ namespace
         constexpr std::string_view ItemQuery = "ITEMQUERY";
         constexpr std::string_view ItemPriceSet = "ITEMPRICESET";
         constexpr std::string_view ItemSearch = "ITEMSEARCH";
+        constexpr std::string_view ItemHouseQuery = "ITEMHOUSEQUERY";
+        constexpr std::string_view ItemHouseSet = "ITEMHOUSESET";
+        constexpr std::string_view ItemHouseClear = "ITEMHOUSECLEAR";
 
         // Outbound: server -> client message types.
         constexpr std::string_view Error = "ERROR";
@@ -67,6 +70,9 @@ namespace
         constexpr std::string_view ItemPriceSetResult = "ITEMPRICESETRESULT";
         constexpr std::string_view ItemSearchResult = "ITEMSEARCHRESULT";
         constexpr std::string_view ItemSearchDone = "ITEMSEARCHDONE";
+        constexpr std::string_view ItemHouseQueryResult = "ITEMHOUSEQUERYRESULT";
+        constexpr std::string_view ItemHouseSetResult = "ITEMHOUSESETRESULT";
+        constexpr std::string_view ItemHouseClearResult = "ITEMHOUSECLEARRESULT";
     }
 
     // SETCONFIG keys awaiting a SAVECONFIG. One global set: worldserver hooks are
@@ -687,6 +693,137 @@ namespace
         SendMessage(target, Acore::StringFormat("{}\tok\t{}", Msg::ItemPriceSetResult, itemId));
     }
 
+    // Consolidated per-item, all-houses snapshot for the Price Search tab's
+    // per-house edit panel -- one query instead of three, since a GM picking a
+    // search result wants to see Alliance/Horde/Neutral status at a glance.
+    // tokens[1] is the item id. Reply: ITEMHOUSEQUERYRESULT\titemId\t
+    //   allianceHas\tallianceMarket\thordeHas\thordeMarket\tneutralHas\tneutralMarket
+    void HandleItemHouseQuery(Player* target, std::vector<std::string_view> const& tokens)
+    {
+        if (tokens.size() < 2)
+        {
+            SendError(target, "ITEMHOUSEQUERY needs an item id");
+            return;
+        }
+        uint32 itemId = 0;
+        if (!ASParse::Integer(tokens[1], itemId) || itemId == 0)
+        {
+            SendError(target, "ITEMHOUSEQUERY: bad item id");
+            return;
+        }
+
+        ASConfig* config = AuctionSim::instance()->GetConfig();
+        if (!config)
+        {
+            SendError(target, "ITEMHOUSEQUERY: AuctionSim config not loaded");
+            return;
+        }
+
+        auto houseField = [&](AuctionHouseId houseId) -> std::string {
+            ScannedItem const* row = config->FindHouseScan(itemId, houseId);
+            return row ? Acore::StringFormat("1\t{}", row->GetMarketPrice()) : std::string("0\t0");
+        };
+
+        SendMessage(
+            target,
+            Acore::StringFormat(
+                "{}\t{}\t{}\t{}\t{}",
+                Msg::ItemHouseQueryResult,
+                itemId,
+                houseField(AuctionHouseId::Alliance),
+                houseField(AuctionHouseId::Horde),
+                houseField(AuctionHouseId::Neutral)));
+    }
+
+    // Direct per-house price set for the Price Search tab -- no race-guessing,
+    // acts on exactly the house the GM picked. tokens: itemId, houseId,
+    // marketPrice, listLow, listHigh, typicalStack, stackLow, stackHigh.
+    void HandleItemHouseSet(Player* target, std::vector<std::string_view> const& tokens)
+    {
+        if (tokens.size() < 9)
+        {
+            SendMessage(target, Acore::StringFormat("{}\tfail\tmissing fields", Msg::ItemHouseSetResult));
+            return;
+        }
+
+        uint32 itemId = 0, houseIdRaw = 0, marketPrice = 0, listLow = 0, listHigh = 0;
+        uint32 typicalStack = 0, stackLow = 0, stackHigh = 0;
+        bool parsed = ASParse::Integer(tokens[1], itemId) && ASParse::Integer(tokens[2], houseIdRaw) &&
+            ASParse::Integer(tokens[3], marketPrice) && ASParse::Integer(tokens[4], listLow) &&
+            ASParse::Integer(tokens[5], listHigh) && ASParse::Integer(tokens[6], typicalStack) &&
+            ASParse::Integer(tokens[7], stackLow) && ASParse::Integer(tokens[8], stackHigh);
+        if (!parsed || itemId == 0 || marketPrice == 0)
+        {
+            SendMessage(target, Acore::StringFormat("{}\tfail\tinvalid values", Msg::ItemHouseSetResult));
+            return;
+        }
+
+        AuctionHouseId houseId = static_cast<AuctionHouseId>(houseIdRaw);
+        if (houseId != AuctionHouseId::Alliance && houseId != AuctionHouseId::Horde &&
+            houseId != AuctionHouseId::Neutral)
+        {
+            SendMessage(
+                target, Acore::StringFormat("{}\tfail\tunknown house id {}", Msg::ItemHouseSetResult, houseIdRaw));
+            return;
+        }
+
+        ASConfig* config = AuctionSim::instance()->GetConfig();
+        if (!config)
+        {
+            SendMessage(target, Acore::StringFormat("{}\tfail\tconfig not loaded", Msg::ItemHouseSetResult));
+            return;
+        }
+
+        bool ok = config->SetHouseOverride(
+            itemId, houseId, marketPrice, listLow, listHigh, typicalStack, stackLow, stackHigh);
+        if (!ok)
+        {
+            SendMessage(
+                target,
+                Acore::StringFormat(
+                    "{}\tfail\titem {} not found or couldn't write overrides file", Msg::ItemHouseSetResult,
+                    itemId));
+            return;
+        }
+
+        SendMessage(target, Acore::StringFormat("{}\tok\t{}\t{}", Msg::ItemHouseSetResult, itemId, houseIdRaw));
+    }
+
+    // tokens: itemId, houseId. Removes that house's listing entirely (item stays
+    // listed on any other house it still has a price for).
+    void HandleItemHouseClear(Player* target, std::vector<std::string_view> const& tokens)
+    {
+        if (tokens.size() < 3)
+        {
+            SendMessage(target, Acore::StringFormat("{}\tfail\tmissing fields", Msg::ItemHouseClearResult));
+            return;
+        }
+
+        uint32 itemId = 0, houseIdRaw = 0;
+        if (!ASParse::Integer(tokens[1], itemId) || !ASParse::Integer(tokens[2], houseIdRaw))
+        {
+            SendMessage(target, Acore::StringFormat("{}\tfail\tinvalid values", Msg::ItemHouseClearResult));
+            return;
+        }
+
+        ASConfig* config = AuctionSim::instance()->GetConfig();
+        if (!config)
+        {
+            SendMessage(target, Acore::StringFormat("{}\tfail\tconfig not loaded", Msg::ItemHouseClearResult));
+            return;
+        }
+
+        bool ok = config->ClearHouseOverride(itemId, static_cast<AuctionHouseId>(houseIdRaw));
+        if (!ok)
+        {
+            SendMessage(
+                target, Acore::StringFormat("{}\tfail\titem {} not found", Msg::ItemHouseClearResult, itemId));
+            return;
+        }
+
+        SendMessage(target, Acore::StringFormat("{}\tok\t{}\t{}", Msg::ItemHouseClearResult, itemId, houseIdRaw));
+    }
+
     using CommandHandler = void (*)(Player*, std::vector<std::string_view> const&);
 
     struct CommandRoute
@@ -709,6 +846,9 @@ namespace
         {Msg::ItemQuery, HandleItemQuery},
         {Msg::ItemPriceSet, HandleItemPriceSet},
         {Msg::ItemSearch, HandleItemSearch},
+        {Msg::ItemHouseQuery, HandleItemHouseQuery},
+        {Msg::ItemHouseSet, HandleItemHouseSet},
+        {Msg::ItemHouseClear, HandleItemHouseClear},
     };
 
     void HandleRequest(Player* player, std::string const& payload)

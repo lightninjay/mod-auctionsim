@@ -1,4 +1,5 @@
 #include "ASConfig.h"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -9,6 +10,7 @@
 #include "ASParse.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
+#include "ItemPriceSuggestion.h"
 #include "ObjectMgr.h"
 #include "QueryResult.h"
 #include "ScannedItem.h"
@@ -68,7 +70,7 @@ ASConfig::ASConfig(std::string const& filepath, bool& outLoaded)
     // below so the buy-side guard and the Neutral gate always have their data.
     LoadVendorItems();
     LoadNeutralConfig();
-    LoadItemExceptions();
+    LoadItemExceptions(filepath);
 
     if (!std::filesystem::exists(filepath))
     {
@@ -133,6 +135,13 @@ ASConfig::ASConfig(std::string const& filepath, bool& outLoaded)
     std::filesystem::path datPath(filepath);
     overridesFilePath = (datPath.parent_path() / "auctionsim_overrides.dat").string();
     LoadOverrides();
+
+    // Must run after LoadOverrides (so a real GM override always wins over an
+    // auto-suggested placeholder) and before SynthesizeNeutralDepth (which needs
+    // ItemSelectionTable[Neutral] to already reflect every configured item).
+    SynthesizeMissingNeutralItems();
+
+    RebuildSearchableItemIds();
 
     SynthesizeNeutralDepth();
 
@@ -240,6 +249,7 @@ void ASConfig::BuildSelectionTables(std::string const& filepath)
         this->ItemSelectionTable[house][proto->Class][proto->Quality].push_back(&item);
         this->ItemIndex.try_emplace(IndexKey(house, proto->Class, proto->Quality, item.GetItemID()), &item);
         this->ByItemId.try_emplace(item.GetItemID(), &item);
+        this->ByItemHouse.try_emplace(ItemHouseKey(item.GetItemID(), static_cast<AuctionHouseId>(house)), &item);
 
         // Neutral-eligible items list on the Neutral bucket IN ADDITION TO their
         // native faction bucket (not instead of) -- they're still buyable on their
@@ -251,6 +261,7 @@ void ASConfig::BuildSelectionTables(std::string const& filepath)
             this->ItemSelectionTable[neutralHouse][proto->Class][proto->Quality].push_back(&item);
             this->ItemIndex.try_emplace(
                 IndexKey(neutralHouse, proto->Class, proto->Quality, item.GetItemID()), &item);
+            this->ByItemHouse.try_emplace(ItemHouseKey(item.GetItemID(), AuctionHouseId::Neutral), &item);
         }
     }
 }
@@ -297,23 +308,131 @@ void ASConfig::LoadNeutralConfig()
 // exclude from more than one house); a bad or zero bitmask, a bad item id, or a
 // malformed pair is logged and skipped rather than aborting the whole line, same
 // as every other loader here.
-void ASConfig::LoadItemExceptions()
+// Parses one exception-list line, bare "itemId" or "itemId:mask". A bare
+// itemId implies mask=7 (excluded from every house) -- the natural default for
+// a big flat dump list where every entry means "never list this," as opposed
+// to the inline AuctionSim.ItemExceptions setting where per-house nuance is
+// more likely to matter for a short hand-curated list. Returns false (and logs
+// via the caller) on anything unparseable.
+namespace
+{
+    bool ParseExceptionLine(std::string_view line, uint32& outItemId, uint8& outMask)
+    {
+        std::vector<std::string_view> parts = Acore::Tokenize(line, ':', false);
+        if (parts.size() == 1)
+        {
+            uint32 itemId = 0;
+            if (!ASParse::Integer(parts[0], itemId) || itemId == 0)
+            {
+                return false;
+            }
+            outItemId = itemId;
+            outMask = 7;
+            return true;
+        }
+        if (parts.size() == 2)
+        {
+            uint32 itemId = 0;
+            uint32 mask = 0;
+            if (!ASParse::Integer(parts[0], itemId) || itemId == 0 || !ASParse::Integer(parts[1], mask) ||
+                mask == 0 || mask > 7)
+            {
+                return false;
+            }
+            outItemId = itemId;
+            outMask = static_cast<uint8>(mask);
+            return true;
+        }
+        return false;
+    }
+}
+
+void ASConfig::LoadItemExceptions(std::string const& datFilePath)
 {
     itemHouseExceptions.clear();
 
     std::string raw = sConfigMgr->GetOption<std::string>("AuctionSim.ItemExceptions", "");
     for (std::string_view pair : Acore::Tokenize(raw, ',', false))
     {
-        std::vector<std::string_view> parts = Acore::Tokenize(pair, ':', false);
         uint32 itemId = 0;
-        uint32 mask = 0;
-        if (parts.size() != 2 || !ASParse::Integer(parts[0], itemId) || itemId == 0 ||
-            !ASParse::Integer(parts[1], mask) || mask == 0 || mask > 7)
+        uint8 mask = 0;
+        if (!ParseExceptionLine(pair, itemId, mask))
         {
             LOG_ERROR("module", "AuctionSim: skipping malformed AuctionSim.ItemExceptions entry '{}'", pair);
             continue;
         }
-        itemHouseExceptions[itemId] = static_cast<uint8>(mask);
+        itemHouseExceptions[itemId] = mask;
+    }
+
+    // AuctionSim.ItemExceptionFiles: comma-separated filenames, each holding one
+    // exception per line (bare itemId, or itemId:mask for per-house control).
+    // Resolved relative to auctionsim.dat's own directory -- e.g. drop
+    // tbc_exclusions.txt next to auctionsim.dat in the module's config folder
+    // and just list "tbc_exclusions.txt" here, matching how the module already
+    // locates auctionsim.dat and auctionsim_overrides.dat. Meant for large
+    // curated dumps (hundreds/thousands of ids) that would be unwieldy as a
+    // single inline config line.
+    std::filesystem::path datDir = std::filesystem::path(datFilePath).parent_path();
+    std::string filesRaw = sConfigMgr->GetOption<std::string>("AuctionSim.ItemExceptionFiles", "");
+    size_t filesLoaded = 0;
+    size_t entriesFromFiles = 0;
+    for (std::string_view filenameTok : Acore::Tokenize(filesRaw, ',', false))
+    {
+        std::string filename(filenameTok);
+        std::filesystem::path fullPath = datDir / filename;
+
+        std::error_code ec;
+        if (!std::filesystem::exists(fullPath, ec))
+        {
+            LOG_ERROR("module", "AuctionSim: ItemExceptionFiles entry '{}' not found (looked in {})", filename, fullPath.string());
+            continue;
+        }
+
+        std::ifstream fileStream(fullPath, std::ios::in);
+        if (!fileStream.is_open())
+        {
+            LOG_ERROR("module", "AuctionSim: couldn't open ItemExceptionFiles entry '{}'", filename);
+            continue;
+        }
+
+        std::string line;
+        size_t malformedInFile = 0;
+        while (std::getline(fileStream, line))
+        {
+            if (line.empty() || line[0] == '#')
+            {
+                continue;
+            }
+            uint32 itemId = 0;
+            uint8 mask = 0;
+            if (!ParseExceptionLine(line, itemId, mask))
+            {
+                malformedInFile++;
+                continue;
+            }
+            itemHouseExceptions[itemId] = mask;
+            entriesFromFiles++;
+        }
+
+        if (malformedInFile > 0)
+        {
+            LOG_ERROR(
+                "module",
+                "AuctionSim: {} had {} malformed line(s) (expected \"itemId\" or \"itemId:mask\"), skipped",
+                filename,
+                malformedInFile);
+        }
+        filesLoaded++;
+    }
+
+    if (filesLoaded > 0)
+    {
+        LOG_INFO(
+            "module",
+            "AuctionSim: loaded {} entr{} from {} ItemExceptionFiles file(s)",
+            entriesFromFiles,
+            entriesFromFiles == 1 ? "y" : "ies",
+            filesLoaded);
     }
 
     LOG_INFO("module", "AuctionSim: {} item auction-house exception(s) configured", itemHouseExceptions.size());
@@ -374,9 +493,23 @@ void ASConfig::SynthesizeNeutralDepth()
 
             CategoryDepth const& a = this->categoryDepth[allianceHouse][itemClass][quality];
             CategoryDepth const& h = this->categoryDepth[hordeHouse][itemClass][quality];
+            CategoryDepth& depth = this->categoryDepth[neutralHouse][itemClass][quality];
+
             if (!a.has && !h.has)
             {
-                continue;  // neither native house has ever seen this category either
+                // Neither native house has ever seen this category -- plausible for
+                // the kind of item AuctionSim.NeutralItems is meant for (rare/
+                // faction-exclusive items with little or no real market history).
+                // Falling through to "no profile" here would mean this category
+                // NEVER lists, regardless of how many items are queued for it (see
+                // AuctionListingService::ListNewAuctions' depth.has gate) -- so give
+                // it a small fixed baseline instead of skipping it outright.
+                depth.has = true;
+                depth.q1 = 1;
+                depth.median = 1;
+                depth.adjLow = 1;
+                depth.adjHigh = std::max<uint32>(1, static_cast<uint32>(2 * scale + 0.5f));
+                continue;
             }
 
             // Blend whichever side(s) have data; average when both do.
@@ -386,7 +519,6 @@ void ASConfig::SynthesizeNeutralDepth()
                 return static_cast<uint32>((static_cast<float>(sum) / divisor) * scale + 0.5f);
             };
 
-            CategoryDepth& depth = this->categoryDepth[neutralHouse][itemClass][quality];
             depth.has = true;
             depth.q1 = blend(&CategoryDepth::q1);
             depth.median = blend(&CategoryDepth::median);
@@ -575,6 +707,112 @@ ScannedItem const* ASConfig::FindAnyScan(uint32 itemId) const
     return it != ByItemId.end() ? it->second : nullptr;
 }
 
+ScannedItem const* ASConfig::FindHouseScan(uint32 itemId, AuctionHouseId houseId) const
+{
+    auto it = ByItemHouse.find(ItemHouseKey(itemId, houseId));
+    return it != ByItemHouse.end() ? it->second : nullptr;
+}
+
+void ASConfig::RebuildSearchableItemIds()
+{
+    searchableItemIds.clear();
+    searchableItemIds.reserve(ByItemId.size());
+    for (auto const& [itemId, row] : ByItemId)
+    {
+        (void)row;
+        searchableItemIds.push_back(itemId);
+    }
+}
+
+// Removes any existing override row for exactly (itemId, houseId) -- a different
+// house's row for the same item is left untouched. The row can't be erased from
+// the ScanData deque without invalidating other rows' pointers, so it's left as an
+// orphan once its bucket/index/ByItemHouse entries are cleaned out (harmless:
+// nothing still points at it).
+void ASConfig::RemoveOrphanedOverrideRow(uint32 itemId, AuctionHouseId houseId)
+{
+    for (auto& row : ScanData)
+    {
+        if (row.IsOverride() && row.GetItemID() == itemId && row.GetFactionNum() == static_cast<uint8>(houseId))
+        {
+            for (auto& classBuckets : ItemSelectionTable)
+            {
+                for (auto& qualityBuckets : classBuckets)
+                {
+                    for (auto& bucket : qualityBuckets)
+                    {
+                        bucket.erase(std::remove(bucket.begin(), bucket.end(), &row), bucket.end());
+                    }
+                }
+            }
+        }
+    }
+    ByItemHouse.erase(ItemHouseKey(itemId, houseId));
+}
+
+bool ASConfig::FileHouseOverrideRow(
+    uint32 itemId,
+    AuctionHouseId houseId,
+    uint32 marketPrice,
+    uint32 listLow,
+    uint32 listHigh,
+    uint32 typicalStack,
+    uint32 stackLow,
+    uint32 stackHigh,
+    bool persist)
+{
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+    if (!proto || proto->Class >= MAX_ITEM_CLASS || proto->Quality >= MAX_ITEM_QUALITY ||
+        static_cast<size_t>(houseId) >= kAuctionHouseIndexBound)
+    {
+        return false;
+    }
+
+    RemoveOrphanedOverrideRow(itemId, houseId);
+
+    ScanData.push_back(ScannedItem::FromOverride(
+        static_cast<uint8>(houseId), itemId, marketPrice, listLow, listHigh, typicalStack, stackLow, stackHigh,
+        persist));
+    ScannedItem& row = ScanData.back();
+
+    size_t house = static_cast<size_t>(houseId);
+    ItemSelectionTable[house][proto->Class][proto->Quality].push_back(&row);
+    ItemIndex.insert_or_assign(IndexKey(house, proto->Class, proto->Quality, itemId), &row);
+    ByItemId.insert_or_assign(itemId, &row);
+    ByItemHouse.insert_or_assign(ItemHouseKey(itemId, houseId), &row);
+    return true;
+}
+
+bool ASConfig::SetHouseOverride(
+    uint32 itemId,
+    AuctionHouseId houseId,
+    uint32 marketPrice,
+    uint32 listLow,
+    uint32 listHigh,
+    uint32 typicalStack,
+    uint32 stackLow,
+    uint32 stackHigh)
+{
+    if (!FileHouseOverrideRow(itemId, houseId, marketPrice, listLow, listHigh, typicalStack, stackLow, stackHigh))
+    {
+        return false;
+    }
+    RebuildSearchableItemIds();
+    return WriteOverridesFile();
+}
+
+bool ASConfig::ClearHouseOverride(uint32 itemId, AuctionHouseId houseId)
+{
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+    if (!proto)
+    {
+        return false;
+    }
+    RemoveOrphanedOverrideRow(itemId, houseId);
+    RebuildSearchableItemIds();
+    return WriteOverridesFile();
+}
+
 // Reads auctionsim_overrides.dat (if present -- fine if it isn't, no GM has
 // priced anything manually yet) and files every row exactly like a real scan.
 void ASConfig::LoadOverrides()
@@ -621,35 +859,33 @@ void ASConfig::LoadOverrides()
             continue;
         }
 
-        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
-        if (!proto)
+        AuctionHouseId houseId = static_cast<AuctionHouseId>(faction);
+        if (!FileHouseOverrideRow(
+                itemId, houseId, marketPrice, listLow, listHigh, typicalStack, stackLow, stackHigh))
         {
             LOG_WARN("module", "AuctionSim: override for item {} has no item_template, skipping", itemId);
             continue;
         }
 
-        ScanData.push_back(ScannedItem::FromOverride(
-            static_cast<uint8>(faction), itemId, marketPrice, listLow, listHigh, typicalStack, stackLow, stackHigh));
-        ScannedItem& row = ScanData.back();
-
-        size_t house = faction;
-        if (house < kAuctionHouseIndexBound)
-        {
-            ItemSelectionTable[house][proto->Class][proto->Quality].push_back(&row);
-            ItemIndex.try_emplace(IndexKey(house, proto->Class, proto->Quality, itemId), &row);
-        }
-        ByItemId.insert_or_assign(itemId, &row);
-
+        // Backward-compat: older override files could set this trailing flag on a
+        // non-Neutral row to mean "also list on Neutral AH". Current writes always
+        // give the Neutral row its own line (faction=7), but this keeps any
+        // pre-existing auctionsim_overrides.dat working unchanged.
         if (neutralFlag != 0)
         {
             neutralEligibleItems.insert(itemId);
-            size_t neutralHouse = static_cast<size_t>(AuctionHouseId::Neutral);
-            ItemSelectionTable[neutralHouse][proto->Class][proto->Quality].push_back(&row);
-            ItemIndex.try_emplace(IndexKey(neutralHouse, proto->Class, proto->Quality, itemId), &row);
+            if (houseId != AuctionHouseId::Neutral)
+            {
+                FileHouseOverrideRow(
+                    itemId, AuctionHouseId::Neutral, marketPrice, listLow, listHigh, typicalStack, stackLow,
+                    stackHigh);
+            }
         }
 
         loaded++;
     }
+
+    RebuildSearchableItemIds();
 
     if (loaded > 0)
     {
@@ -667,18 +903,25 @@ bool ASConfig::WriteOverridesFile() const
             LOG_ERROR("module", "AuctionSim: couldn't open {} for writing", tempPath);
             return false;
         }
-        stream << "# GM-entered item prices from the ahsim addon's item pricer.\n";
+        stream << "# GM-entered item prices from the ahsim addon (Item Pricer / Price Search tab).\n";
         stream << "# itemId:faction:marketPrice:listLow:listHigh:typicalStack:stackLow:stackHigh:neutralEligible\n";
-        for (ScannedItem const& item : ScanData)
+
+        // Iterates ByItemHouse (the authoritative "what's live right now" map)
+        // rather than ScanData directly -- ScanData accumulates every override row
+        // ever created, including ones SetHouseOverride/ClearHouseOverride have
+        // since orphaned by superseding or removing them. Writing straight from
+        // ScanData would resurrect a cleared price on the next restart.
+        for (auto const& [key, row] : ByItemHouse)
         {
-            if (!item.IsOverride())
+            (void)key;
+            if (!row->IsOverride())
             {
                 continue;
             }
-            stream << item.GetItemID() << ":" << static_cast<uint32>(item.GetFactionNum()) << ":"
-                   << item.GetMarketPrice() << ":" << item.GetListLow() << ":" << item.GetListHigh() << ":"
-                   << item.GetTypicalStackSize() << ":" << item.GetStackLow() << ":" << item.GetStackHigh() << ":"
-                   << (neutralEligibleItems.count(item.GetItemID()) ? 1 : 0) << "\n";
+            stream << row->GetItemID() << ":" << static_cast<uint32>(row->GetFactionNum()) << ":"
+                   << row->GetMarketPrice() << ":" << row->GetListLow() << ":" << row->GetListHigh() << ":"
+                   << row->GetTypicalStackSize() << ":" << row->GetStackLow() << ":" << row->GetStackHigh() << ":"
+                   << (neutralEligibleItems.count(row->GetItemID()) ? 1 : 0) << "\n";
         }
     }
 
@@ -690,6 +933,61 @@ bool ASConfig::WriteOverridesFile() const
         return false;
     }
     return true;
+}
+
+// AuctionSim.NeutralItems entries with no real scan data and no GM-confirmed
+// override never got filed into the Neutral bucket at all (BuildSelectionTables
+// only iterates real scan rows), so SynthesizeNeutralDepth would see an empty
+// pool for every category and the item would silently never list. Runs once at
+// config load; auto-prices any such entry via ItemPriceSuggestion and files it
+// as a non-persisted row.
+void ASConfig::SynthesizeMissingNeutralItems()
+{
+    if (!enableNeutralAH)
+    {
+        return;
+    }
+
+    uint32 synthesized = 0;
+    std::vector<uint32> ids(neutralEligibleItems.begin(), neutralEligibleItems.end());
+    for (uint32 itemId : ids)
+    {
+        if (FindHouseScan(itemId, AuctionHouseId::Neutral))
+        {
+            continue;  // already has real scan data, a prior GM override, or was
+                       // already synthesized on an earlier load -- don't reprice it.
+        }
+
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+        if (!proto)
+        {
+            LOG_WARN(
+                "module",
+                "AuctionSim: AuctionSim.NeutralItems entry {} has no item_template, skipping",
+                itemId);
+            continue;
+        }
+
+        ItemPriceSuggestion::Suggestion s = ItemPriceSuggestion::Suggest(proto, itemId);
+        // persist=false: this is a guess, not a GM-confirmed price -- never let it
+        // get written to auctionsim_overrides.dat as a side effect of some other,
+        // unrelated save (see ScannedItem::FromOverride's markAsOverride).
+        if (FileHouseOverrideRow(
+                itemId, AuctionHouseId::Neutral, s.marketPrice, s.listLow, s.listHigh, s.typicalStack, s.stackLow,
+                s.stackHigh, false))
+        {
+            synthesized++;
+        }
+    }
+
+    if (synthesized > 0)
+    {
+        LOG_INFO(
+            "module",
+            "AuctionSim: auto-priced {} AuctionSim.NeutralItems entr{} with no existing scan/override data",
+            synthesized,
+            synthesized == 1 ? "y" : "ies");
+    }
 }
 
 // Guesses this item's native faction bucket from its allowable-race mask so a
@@ -730,8 +1028,6 @@ bool ASConfig::UpsertOverride(
 
     bool allianceUsable = proto->AllowableRace == 0 || (proto->AllowableRace & kAllianceRaceMask) != 0;
     bool hordeUsable = proto->AllowableRace == 0 || (proto->AllowableRace & kHordeRaceMask) != 0;
-    // Race-locked to exactly one side -- list only there; everyone else lists both,
-    // same rationale as the comment above.
     if ((proto->AllowableRace & kAllianceRaceMask) != 0 && (proto->AllowableRace & kHordeRaceMask) == 0)
     {
         hordeUsable = false;
@@ -740,72 +1036,47 @@ bool ASConfig::UpsertOverride(
     {
         allianceUsable = false;
     }
-
-    // Remove any prior override row(s) for this item before re-filing -- an edit
-    // replaces, it doesn't stack duplicate rows into the selection tables.
-    for (auto& row : ScanData)
+    if (!allianceUsable && !hordeUsable)
     {
-        if (row.IsOverride() && row.GetItemID() == itemId)
-        {
-            // Row can't be erased from the deque without invalidating pointers
-            // other rows depend on; instead its bucket entries are removed below
-            // and it's left as an orphaned, never-selected row (harmless: nothing
-            // still points at it once ItemSelectionTable/ItemIndex are cleaned).
-            for (auto& classBuckets : ItemSelectionTable)
-            {
-                for (auto& qualityBuckets : classBuckets)
-                {
-                    for (auto& bucket : qualityBuckets)
-                    {
-                        bucket.erase(std::remove(bucket.begin(), bucket.end(), &row), bucket.end());
-                    }
-                }
-            }
-        }
+        allianceUsable = true;
     }
 
-    std::vector<std::pair<uint8, bool>> housesToFile;
+    bool ok = false;
+    bool attemptedAny = false;
     if (allianceUsable)
     {
-        housesToFile.emplace_back(static_cast<uint8>(AuctionHouseId::Alliance), false);
+        attemptedAny = true;
+        ok |= FileHouseOverrideRow(
+            itemId, AuctionHouseId::Alliance, marketPrice, listLow, listHigh, typicalStack, stackLow, stackHigh);
     }
     if (hordeUsable)
     {
-        housesToFile.emplace_back(static_cast<uint8>(AuctionHouseId::Horde), false);
-    }
-    if (housesToFile.empty())
-    {
-        // Shouldn't happen given the logic above, but never silently drop the item.
-        housesToFile.emplace_back(static_cast<uint8>(AuctionHouseId::Alliance), false);
+        attemptedAny = true;
+        ok |= FileHouseOverrideRow(
+            itemId, AuctionHouseId::Horde, marketPrice, listLow, listHigh, typicalStack, stackLow, stackHigh);
     }
 
-    for (auto const& [faction, unused] : housesToFile)
-    {
-        (void)unused;
-        ScanData.push_back(ScannedItem::FromOverride(
-            faction, itemId, marketPrice, listLow, listHigh, typicalStack, stackLow, stackHigh));
-        ScannedItem& row = ScanData.back();
-        size_t house = faction;
-        ItemSelectionTable[house][proto->Class][proto->Quality].push_back(&row);
-        ItemIndex.insert_or_assign(IndexKey(house, proto->Class, proto->Quality, itemId), &row);
-        ByItemId.insert_or_assign(itemId, &row);
-
-        if (neutralEligible)
-        {
-            size_t neutralHouse = static_cast<size_t>(AuctionHouseId::Neutral);
-            ItemSelectionTable[neutralHouse][proto->Class][proto->Quality].push_back(&row);
-            ItemIndex.insert_or_assign(IndexKey(neutralHouse, proto->Class, proto->Quality, itemId), &row);
-        }
-    }
-
+    // Fixes a gap in the original version of this method: checking "Also list on
+    // Neutral AH" used to only set the neutralEligibleItems flag (which duplicates
+    // a real *scanned* row onto Neutral) without ever actually creating a Neutral
+    // override row -- so a hand-priced item with no scan data would never show up
+    // on the Neutral AH despite the checkbox being checked. Now it files a real row.
     if (neutralEligible)
     {
+        attemptedAny = true;
+        ok |= FileHouseOverrideRow(
+            itemId, AuctionHouseId::Neutral, marketPrice, listLow, listHigh, typicalStack, stackLow, stackHigh);
         neutralEligibleItems.insert(itemId);
     }
     else
     {
+        RemoveOrphanedOverrideRow(itemId, AuctionHouseId::Neutral);
         neutralEligibleItems.erase(itemId);
     }
 
-    return WriteOverridesFile();
+    RebuildSearchableItemIds();
+    // Reports success if at least one house's row was actually filed -- e.g. an
+    // Alliance/Horde item where only one side is blocked should still report
+    // success for the side that worked, not a blanket failure.
+    return attemptedAny && ok && WriteOverridesFile();
 }
