@@ -3,6 +3,7 @@
 #include <cmath>
 #include <string>
 #include "DatabaseEnv.h"
+#include "QueryResult.h"
 #include "ItemTemplate.h"
 
 namespace
