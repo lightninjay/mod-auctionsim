@@ -231,11 +231,6 @@ namespace AuctionPricing
         return requiredLevelOk && itemLevelOk;
     }
 
-    bool IsWithinVendorBuyPrice(uint32 pricePerItem, uint32 vendorBuyPrice)
-    {
-        return vendorBuyPrice == 0 || pricePerItem <= vendorBuyPrice;
-    }
-
     bool IsBuyableQuality(uint32 quality)
     {
         return quality != 0;  // 0 == ITEM_QUALITY_POOR (grey)

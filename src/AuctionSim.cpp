@@ -179,8 +179,9 @@ bool AuctionSim::StartOrReloadBot(bool reloadConfig)
         return false;
     }
 
-    // "Set Bot Char" just rewrote BotAccountID/BotCharacterID; reload so Bot's ctor
-    // and the mail hook see them. A failed reload leaves any running bot alone.
+    // Reload so BotPool's constructor and the mail hook see any config change --
+    // e.g. an admin editing BotCharacterIDs/BotAccountIDs directly in
+    // auctionsim.conf. A failed reload leaves any running roster alone.
     if (reloadConfig && !sConfigMgr->Reload())
     {
         return false;
@@ -269,17 +270,9 @@ void AuctionSim::ScanAuctions(AuctionHouseId _AuctionHouseId)
 
         uint32 pricePerItem = auction->buyout / auction->itemCount;
 
-        // Never buy grey items, and never pay more per unit than it would cost to buy
-        // the item straight from a vendor -- both are gold-cheese vectors. The vendor
-        // cap only applies when a vendor actually stocks the item (npc_vendor): a
-        // BuyPrice left on an item no vendor sells is stale DB data, not a real floor,
-        // so those pass the check (0 disables it). Grey auctions are still counted
-        // above so the listing side is unaffected.
-        uint32 vendorBuyPrice = (config->IsVendorSold(auction->item_template) && proto->BuyPrice > 0)
-            ? static_cast<uint32>(proto->BuyPrice)
-            : 0;
-        if (!AuctionPricing::IsBuyableQuality(proto->Quality) ||
-            !AuctionPricing::IsWithinVendorBuyPrice(pricePerItem, vendorBuyPrice))
+        // Never buy grey items -- no real market for them, and any that turn up
+        // are noise, not a legitimate craft/farm alternative worth pricing against.
+        if (!AuctionPricing::IsBuyableQuality(proto->Quality))
         {
             continue;
         }
@@ -323,6 +316,14 @@ AuctionSim::BuyQueueStatus AuctionSim::GetBuyQueueStatus(time_t now) const
     // SortQueue keeps the soonest-due purchase at the back and the furthest-due at
     // the front.
     return {queue.size(), queue.back().buyTime - now, queue.front().buyTime - now};
+}
+
+AuctionBuyingService::ForceBuyResult AuctionSim::ForceNextBuy()
+{
+    // Same convention as GetBuyQueueStatus above: callers (the ".auctionsim" and
+    // addon-bridge command handlers) are expected to have already gated on
+    // RequireEnabled, since buyingService only exists while the module is.
+    return buyingService->ForceNextBuy();
 }
 
 uint32 AuctionSim::CleanOverCapAuctions()

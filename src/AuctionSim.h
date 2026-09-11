@@ -26,6 +26,11 @@ public:
     std::vector<AuctionSimTests::TestResult> RunTests();
     std::vector<AuctionBuyingService::QueuedPurchase> const& GetBuyQueue() const { return buyingService->GetQueue(); }
 
+    // Delegates to AuctionBuyingService::ForceNextBuy -- see its doc comment.
+    // Requires the module to be enabled (buyingService only exists while it is);
+    // returns a queueWasEmpty result if it isn't rather than crashing.
+    AuctionBuyingService::ForceBuyResult ForceNextBuy();
+
     // Buy-queue summary for the ".auctionsim showqueue" command and the addon's
     // Show Queue button, so the "soonest-due at the back" ordering lives in one place.
     struct BuyQueueStatus

@@ -459,27 +459,6 @@ namespace
         return Pass("IsWithinLevelCap boundary");
     }
 
-    TestResult TestIsWithinVendorBuyPriceBoundary()
-    {
-        if (!AuctionPricing::IsWithinVendorBuyPrice(1'000'000, 0))
-        {
-            return Fail("IsWithinVendorBuyPrice boundary", "buyPrice 0 (no vendor purchase price) rejected a buy");
-        }
-        if (!AuctionPricing::IsWithinVendorBuyPrice(500, 500))
-        {
-            return Fail("IsWithinVendorBuyPrice boundary", "price equal to the vendor buy price was rejected");
-        }
-        if (!AuctionPricing::IsWithinVendorBuyPrice(499, 500))
-        {
-            return Fail("IsWithinVendorBuyPrice boundary", "price below the vendor buy price was rejected");
-        }
-        if (AuctionPricing::IsWithinVendorBuyPrice(501, 500))
-        {
-            return Fail("IsWithinVendorBuyPrice boundary", "price above the vendor buy price was accepted");
-        }
-        return Pass("IsWithinVendorBuyPrice boundary");
-    }
-
     TestResult TestIsBuyableQuality()
     {
         if (AuctionPricing::IsBuyableQuality(0))
@@ -669,7 +648,6 @@ namespace AuctionSimTests
             TestListingCountMath(),
             TestWeightedPick(),
             TestIsWithinLevelCapBoundary(),
-            TestIsWithinVendorBuyPriceBoundary(),
             TestIsBuyableQuality(),
             TestBuyQueuePopulatesOnQualifyingPrice(botPool, config),
             TestBuyQueueDedupesRescan(botPool, config),

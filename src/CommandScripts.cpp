@@ -7,6 +7,7 @@
 #include "ChatCommand.h"
 #include "GameTime.h"
 #include "Log.h"
+#include "ObjectMgr.h"
 #include "ScriptMgr.h"
 
 using namespace Acore::ChatCommands;
@@ -49,6 +50,7 @@ public:
             {"test", HandleTestCommand, SEC_ADMINISTRATOR, Console::Yes},
             {"cleanovercap", HandleCleanOverCapCommand, SEC_ADMINISTRATOR, Console::Yes},
             {"showqueue", HandleShowQueueCommand, SEC_ADMINISTRATOR, Console::Yes},
+            {"forcebuy", HandleForceBuyCommand, SEC_ADMINISTRATOR, Console::Yes},
             {"status", HandleStatusCommand, SEC_ADMINISTRATOR, Console::Yes},
         };
         static ChatCommandTable commandTable = {
@@ -182,6 +184,29 @@ public:
                   status.size,
                   status.nextBuyInSeconds,
                   status.lastBuyInSeconds);
+        LOG_INFO("module", "{}", message);
+        handler->SendSysMessage(message);
+        return true;
+    }
+
+    static bool HandleForceBuyCommand(ChatHandler* handler)
+    {
+        if (!RequireEnabled(handler))
+        {
+            return true;
+        }
+
+        AuctionBuyingService::ForceBuyResult result = AuctionSim::instance()->ForceNextBuy();
+        if (result.queueWasEmpty)
+        {
+            handler->SendSysMessage("AuctionSim: buy queue is empty, nothing to force.");
+            return true;
+        }
+
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(result.itemTemplateId);
+        std::string itemName = proto ? proto->Name1 : fmt::format("item {}", result.itemTemplateId);
+        std::string message = fmt::format(
+            "AuctionSim: force-bought {} x{} for {}c.", itemName, result.itemCount, result.buyoutPrice);
         LOG_INFO("module", "{}", message);
         handler->SendSysMessage(message);
         return true;

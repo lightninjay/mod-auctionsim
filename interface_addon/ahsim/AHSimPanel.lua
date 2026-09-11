@@ -96,7 +96,6 @@ local enabledCheckbox, startupScanCheckbox
 local maxRequiredLevelBox, maxItemLevelBox
 local resultsLog                 -- ScrollingMessageFrame, created in BuildWindow
 local pendingResultLines = {}    -- lines logged before the window exists
-local setBotCharFrame, setBotCharInput
 local helpFrame
 
 -- A ScrollingMessageFrame keeps its own line buffer and renders each line on its
@@ -198,75 +197,16 @@ local function CreateCommandButton(parent, label, x, y, width, onClick)
     return btn
 end
 
--- Set Bot Char dialog. Okay sends SETBOTCHAR; the server validates against the
--- characters DB and replies SETBOTCHARRESULT. A failure keeps this open, a success
--- closes it; both log to Results.
-local function SubmitBotChar()
-    local name = strtrim(setBotCharInput:GetText() or "")
-    if name == "" then
-        AddResultLine("|cffff0000Set Bot Char failed:|r no character name entered.")
-        return
-    end
-    -- no self-character check: setup is often done while logged in as the bot
-    AddResultLine("Set Bot Char: looking up \"" .. name .. "\" ...")
-    AHSim:Send(OP.SETBOTCHAR, name)
-end
-
-local POPUP_WIDTH = 380
-local POPUP_MARGIN = 20
-
-local function BuildSetBotCharPopup()
-    if setBotCharFrame then
-        return
-    end
-
-    local f = CreateModuleWindow(
-        "AHSimSetBotCharFrame", POPUP_WIDTH, nil, TITLE_PREFIX .. "Set Bot Character", "FULLSCREEN_DIALOG")
-
-    local promptTop = 40
-    local prompt = f:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-    prompt:SetWidth(POPUP_WIDTH - POPUP_MARGIN * 2)
-    prompt:SetJustifyH("LEFT")
-    prompt:SetJustifyV("TOP")
-    prompt:SetPoint("TOPLEFT", POPUP_MARGIN, -promptTop)
-    prompt:SetText(
-        "Type in the character name that you want to use for the bot. Make sure the character is one " ..
-        "that exists and is not one that you use to play the game.")
-
-    setBotCharInput = CreateFrame("EditBox", "AHSimSetBotCharInput", f)
-    setBotCharInput:SetSize(POPUP_WIDTH - POPUP_MARGIN * 2, 24)
-    setBotCharInput:SetAutoFocus(false)
-    setBotCharInput:SetMaxLetters(12)
-    setBotCharInput:SetFontObject("GameFontHighlight")
-    setBotCharInput:SetTextInsets(6, 6, 0, 0)
-    setBotCharInput:SetBackdrop(EDITBOX_BACKDROP)
-    setBotCharInput:SetBackdropColor(0, 0, 0, 0.45)
-    setBotCharInput:SetBackdropBorderColor(0.65, 0.65, 0.65, 0.9)
-    setBotCharInput:SetScript("OnEscapePressed", setBotCharInput.ClearFocus)
-    setBotCharInput:SetScript("OnEnterPressed", SubmitBotChar)
-
-    -- stack tight: title, wrapped prompt (measured), input, buttons
-    local promptH = math.max(prompt:GetStringHeight(), 48)
-    local inputTop = promptTop + promptH + 12
-    setBotCharInput:SetPoint("TOPLEFT", POPUP_MARGIN, -inputTop)
-
-    local btnW, btnGap = 100, 16
-    local btnTop = inputTop + 24 + 14
-    local btnX = (POPUP_WIDTH - (btnW * 2 + btnGap)) / 2
-    CreateCommandButton(f, "Okay", btnX, -btnTop, btnW, SubmitBotChar)
-    CreateCommandButton(f, "Close", btnX + btnW + btnGap, -btnTop, btnW, function() f:Hide() end)
-
-    f:SetHeight(btnTop + 22 + POPUP_MARGIN)
-
-    setBotCharFrame = f
-end
-
-function AHSim.ShowSetBotCharPopup()
-    BuildSetBotCharPopup()
-    setBotCharInput:SetText((AHSimDB and AHSimDB.botCharName) or "")
-    setBotCharFrame:Show()
-    setBotCharFrame:Raise()
-    setBotCharInput:SetFocus()
+-- Force Buy: executes the soonest-due queued purchase right now, bypassing its
+-- rolled buy time. A one-click action -- no popup needed, unlike the old "Set
+-- Bot Char" button it replaces. Bot-roster membership is now configured via
+-- AuctionSim.BotCharacterIDs / AuctionSim.BotAccountIDs in auctionsim.conf
+-- (see the help text), since it supports any number of characters and an
+-- addon popup asking for one name at a time stopped making sense once that
+-- landed.
+local function SubmitForceBuy()
+    AddResultLine("Force Buy: requesting next queued purchase...")
+    AHSim:Send(OP.FORCEBUY)
 end
 
 -- Scrollable, movable window showing AHSim.helpText (from Help.lua).
@@ -401,7 +341,7 @@ local function BuildBotManagerTab(panel)
     CreateCommandButton(leftColumn, "Run Tests", 0, -ly, LEFT_COLUMN_WIDTH, function() AHSim:Send(OP.TEST) end)
     ly = ly + buttonStep
     CreateCommandButton(
-        leftColumn, "Set Bot Char", 0, -ly, LEFT_COLUMN_WIDTH, function() AHSim.ShowSetBotCharPopup() end)
+        leftColumn, "Force Buy", 0, -ly, LEFT_COLUMN_WIDTH, function() SubmitForceBuy() end)
     ly = ly + buttonStep
     CreateCommandButton(leftColumn, "Help", 0, -ly, LEFT_COLUMN_WIDTH, function() AHSim.ShowHelp() end)
     ly = ly + ROW_HEIGHT
@@ -672,19 +612,17 @@ AHSim:RegisterHandler(OP.ERROR, function(message)
     AddResultLine("|cffff0000Error: " .. (message or "unknown error") .. "|r")
 end)
 
-AHSim:RegisterHandler(OP.SETBOTCHARRESULT, function(status, name, characterId, accountId, note)
-    if status == "ok" then
+local FORCE_BUY_HOUSE_NAMES = { [2] = "Alliance", [6] = "Horde", [7] = "Neutral" }
+
+AHSim:RegisterHandler(OP.FORCEBUYRESULT, function(status, itemName, itemCount, buyoutPrice, houseId)
+    if status == "empty" then
+        AddResultLine("|cffffd100Force Buy:|r queue is empty, nothing to buy.")
+    elseif status == "ok" then
+        local houseName = FORCE_BUY_HOUSE_NAMES[tonumber(houseId)] or "?"
         AddResultLine(sformat(
-            "|cff00ff00Set Bot Char:|r bot set to \"%s\" (character id %s, account id %s).%s",
-            name or "?", characterId or "?", accountId or "?", (note and note ~= "") and (" " .. note) or ""))
-        if AHSimDB then
-            AHSimDB.botCharName = name
-        end
-        if setBotCharFrame then
-            setBotCharFrame:Hide()
-        end
+            "|cff00ff00Force Buy:|r bought %s x%s for %sc (%s AH).",
+            itemName or "?", itemCount or "?", buyoutPrice or "?", houseName))
     else
-        -- failure: the server puts the reason in the first field
-        AddResultLine("|cffff0000Set Bot Char failed:|r " .. (name or "unknown error"))
+        AddResultLine("|cffff0000Force Buy failed:|r " .. (itemName or "unknown error"))
     end
 end)

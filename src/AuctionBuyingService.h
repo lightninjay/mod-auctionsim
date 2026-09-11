@@ -56,6 +56,25 @@ public:
     // bypassing ConsiderForPurchase's price/RNG logic, for deterministic tests.
     void EnqueueForTest(AuctionEntry* auction, time_t buyTime);
 
+    // Info about a forced purchase, captured before BuyItem invalidates the
+    // AuctionEntry (deletes it from the DB and destroys the object).
+    struct ForceBuyResult
+    {
+        bool queueWasEmpty = false;
+        uint32 itemTemplateId = 0;
+        uint32 itemCount = 0;
+        uint32 buyoutPrice = 0;
+        AuctionHouseId houseId = AuctionHouseId::Alliance;
+    };
+
+    // Immediately executes the soonest-due queued purchase, bypassing its rolled
+    // buyTime -- for a GM to trigger via the addon's "Force Buy" button, to test
+    // a buy cycle on demand or drain the queue without resorting to ".auctionsim
+    // delete" (which removes the bot's own listings; this actually buys someone
+    // else's auction, exactly like the queue would have done on its own, just
+    // without waiting). A no-op (queueWasEmpty=true) if nothing is queued.
+    ForceBuyResult ForceNextBuy();
+
 private:
     void BuyItem(AuctionEntry* auction, AuctionHouseId houseId);
 

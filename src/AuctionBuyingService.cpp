@@ -65,6 +65,31 @@ void AuctionBuyingService::EnqueueForTest(AuctionEntry* auction, time_t buyTime)
     _queuedAuctionIds.insert(auction->Id);
 }
 
+AuctionBuyingService::ForceBuyResult AuctionBuyingService::ForceNextBuy()
+{
+    ForceBuyResult result;
+    if (_queue.empty())
+    {
+        result.queueWasEmpty = true;
+        return result;
+    }
+
+    QueuedPurchase next = _queue.back();
+    _queue.pop_back();
+    _queuedAuctionIds.erase(next.auction->Id);
+
+    // Captured before BuyItem runs -- it deletes the AuctionEntry from the DB
+    // and destroys the object via RemoveAuction, so next.auction is dangling
+    // immediately afterward.
+    result.itemTemplateId = next.auction->item_template;
+    result.itemCount = next.auction->itemCount;
+    result.buyoutPrice = next.auction->buyout;
+    result.houseId = next.auction->houseId;
+
+    BuyItem(next.auction, next.auction->houseId);
+    return result;
+}
+
 void AuctionBuyingService::BuyItem(AuctionEntry* auction, AuctionHouseId houseId)
 {
     auto trans = CharacterDatabase.BeginTransaction();

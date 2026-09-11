@@ -33,13 +33,6 @@ public:
     uint32 maxRequiredLevel = 0;
     uint32 maxItemLevel = 0;
 
-    // Every item id stocked by at least one vendor (from npc_vendor). The buy-side
-    // vendor-buy-price guard only applies to items in this set: an
-    // ItemTemplate::BuyPrice left on an item that no vendor actually sells is stale
-    // DB data and must not block an otherwise-good purchase.
-    std::unordered_set<uint32> vendorSoldItems;
-    bool IsVendorSold(uint32 itemId) const { return vendorSoldItems.count(itemId) > 0; }
-
     // Whether the Neutral (goblin) auction houses are populated at all. From
     // AuctionSim.EnableNeutralAH. When false, kAuctionHouseIndexBound's Neutral
     // slot is simply never filled or scanned.
@@ -206,7 +199,6 @@ private:
     void LoadItemRow(std::string const& line, std::string const& filepath);
     void BuildSelectionTables(std::string const& filepath);
     void LoadMasks();
-    void LoadVendorItems();
     void LoadNeutralConfig();
     void SynthesizeNeutralDepth();
     void LoadOverrides();

@@ -13,14 +13,10 @@
 #include "AuctionSim.h"
 #include "ItemPriceSuggestion.h"
 #include "ObjectMgr.h"
-#include <charconv>
-#include <unordered_set>
-#include "CharacterCache.h"
 #include "Common.h"
 #include "Config.h"
 #include "GameTime.h"
 #include "ObjectGuid.h"
-#include "ObjectMgr.h"
 #include "Player.h"
 #include "SharedDefines.h"
 #include "StringFormat.h"
@@ -47,7 +43,7 @@ namespace
         constexpr std::string_view Test = "TEST";
         constexpr std::string_view CleanOverCap = "CLEANOVERCAP";
         constexpr std::string_view ShowQueue = "SHOWQUEUE";
-        constexpr std::string_view SetBotChar = "SETBOTCHAR";
+        constexpr std::string_view ForceBuy = "FORCEBUY";
         constexpr std::string_view ItemQuery = "ITEMQUERY";
         constexpr std::string_view ItemPriceSet = "ITEMPRICESET";
         constexpr std::string_view ItemSearch = "ITEMSEARCH";
@@ -65,7 +61,7 @@ namespace
         constexpr std::string_view TestDone = "TESTDONE";
         constexpr std::string_view QueueInfo = "QUEUEINFO";
         constexpr std::string_view CleanResult = "CLEANRESULT";
-        constexpr std::string_view SetBotCharResult = "SETBOTCHARRESULT";
+        constexpr std::string_view ForceBuyResult = "FORCEBUYRESULT";
         constexpr std::string_view ItemPrice = "ITEMPRICE";
         constexpr std::string_view ItemPriceSetResult = "ITEMPRICESETRESULT";
         constexpr std::string_view ItemSearchResult = "ITEMSEARCHRESULT";
@@ -113,7 +109,10 @@ namespace
         // Enabled can be set before a bot exists; the action commands need one.
         if (!sim->GetBotPlayer())
         {
-            SendError(target, "AuctionSim is enabled but the bot character isn't set up yet -- use Set Bot Char.");
+            SendError(
+                target,
+                "AuctionSim is enabled but no bot character is set up yet -- set "
+                "AuctionSim.BotCharacterIDs or AuctionSim.BotAccountIDs in auctionsim.conf.");
             return false;
         }
         return true;
@@ -165,13 +164,14 @@ namespace
             AuctionSim* sim = AuctionSim::instance();
             sim->isEnabled = (valueStr == "1");
             stagedKeys.insert(key);
-            // Cold start: bring the bot up now. Fine if no bot char yet -- Set Bot
-            // Char starts it.
+            // Cold start: bring the bot roster up now. Fine if there's no bot
+            // character configured yet -- a later config reload starts it.
             if (sim->isEnabled && !sim->GetBotPlayer() && !sim->StartOrReloadBot())
             {
                 SendError(
                     target,
-                    "Enabled saved, but the bot can't run until a valid bot character is set (use Set Bot Char).");
+                    "Enabled saved, but the bot can't run until AuctionSim.BotCharacterIDs or "
+                    "AuctionSim.BotAccountIDs is set in auctionsim.conf.");
             }
             return;
         }
@@ -391,101 +391,36 @@ namespace
                 status.lastBuyInSeconds));
     }
 
-    // Resolve a character name to its guid + account id (only the server can) and
-    // write both to auctionsim.conf. If the module is enabled, restart the bot on it.
-    void HandleSetBotChar(Player* target, std::vector<std::string_view> const& tokens)
+    // Executes the soonest-due queued purchase immediately, bypassing its rolled
+    // buy time -- lets a GM test a buy cycle on demand, or drain the queue
+    // without deleting the bot's own listings (this actually buys someone else's
+    // auction, same as the queue would have done unattended, just not waiting
+    // for the roll). No arguments.
+    void HandleForceBuy(Player* target, std::vector<std::string_view> const&)
     {
-        if (tokens.size() < 2 || tokens[1].empty())
+        if (!RequireEnabled(target))
         {
-            SendMessage(target, Acore::StringFormat("{}\tfail\tno character name given", Msg::SetBotCharResult));
             return;
         }
 
-        std::string name(tokens[1]);
-        if (!normalizePlayerName(name))
+        AuctionBuyingService::ForceBuyResult result = AuctionSim::instance()->ForceNextBuy();
+        if (result.queueWasEmpty)
         {
-            SendMessage(
-                target,
-                Acore::StringFormat(
-                    "{}\tfail\t'{}' is not a valid character name", Msg::SetBotCharResult, name));
+            SendMessage(target, Acore::StringFormat("{}\tempty", Msg::ForceBuyResult));
             return;
         }
 
-        CharacterCacheEntry const* entry = sCharacterCache->GetCharacterCacheByName(name);
-        if (!entry)
-        {
-            SendMessage(
-                target,
-                Acore::StringFormat("{}\tfail\tno character named '{}' exists", Msg::SetBotCharResult, name));
-            return;
-        }
-
-        // no "not your own character" guard: setup is often done while logged in as the bot
-        uint32 characterId = entry->Guid.GetCounter();
-        uint32 accountId = entry->AccountId;
-
-        // ADDS this character to the roster rather than replacing it -- with
-        // multiple bot characters supported, "Set Bot Char" from the addon now
-        // means "add this character," not "swap to this one character." Merge
-        // against whatever BotCharacterIDs already holds, de-duping.
-        std::string existingCsv = sConfigMgr->GetOption<std::string>("AuctionSim.BotCharacterIDs", "");
-        std::unordered_set<uint32> ids;
-        for (std::string_view tok : Acore::Tokenize(existingCsv, ',', false))
-        {
-            uint32 id = 0;
-            auto [ptr, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), id);
-            (void)ptr;
-            if (ec == std::errc() && id != 0)
-            {
-                ids.insert(id);
-            }
-        }
-        ids.insert(characterId);
-
-        std::string merged;
-        bool first = true;
-        for (uint32 id : ids)
-        {
-            if (!first)
-            {
-                merged += ",";
-            }
-            merged += Acore::StringFormat("{}", id);
-            first = false;
-        }
-
-        bool wrote = ASConfigWriter::SetMany(
-            GetConfFilePath(), {{"BotCharacterIDs", "", merged}});
-        if (!wrote)
-        {
-            SendMessage(
-                target,
-                Acore::StringFormat(
-                    "{}\tfail\tfound the character but couldn't write auctionsim.conf, check the server log",
-                    Msg::SetBotCharResult));
-            return;
-        }
-
-        // enabled -> rebuild the roster live; disabled -> it waits for enable
-        AuctionSim* sim = AuctionSim::instance();
-        std::string note;
-        if (!sim->isEnabled)
-        {
-            note = "Saved. This character joins the bot roster when you enable the module.";
-        }
-        else if (sim->StartOrReloadBot())
-        {
-            note = Acore::StringFormat("Bot roster reloaded ({} character(s)); no restart needed.", ids.size());
-        }
-        else
-        {
-            note = "Written to auctionsim.conf, but the live reload failed -- restart to apply.";
-        }
-
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(result.itemTemplateId);
+        std::string itemName = proto ? proto->Name1 : Acore::StringFormat("item {}", result.itemTemplateId);
         SendMessage(
             target,
             Acore::StringFormat(
-                "{}\tok\t{}\t{}\t{}\t{}", Msg::SetBotCharResult, name, characterId, accountId, note));
+                "{}\tok\t{}\t{}\t{}\t{}",
+                Msg::ForceBuyResult,
+                itemName,
+                result.itemCount,
+                result.buyoutPrice,
+                static_cast<uint32>(result.houseId)));
     }
 
     // First request on load. A reply (GM-only) is the client's cue to build the window.
@@ -842,7 +777,7 @@ namespace
         {Msg::Test, HandleTest},
         {Msg::CleanOverCap, HandleCleanOverCap},
         {Msg::ShowQueue, HandleShowQueue},
-        {Msg::SetBotChar, HandleSetBotChar},
+        {Msg::ForceBuy, HandleForceBuy},
         {Msg::ItemQuery, HandleItemQuery},
         {Msg::ItemPriceSet, HandleItemPriceSet},
         {Msg::ItemSearch, HandleItemSearch},

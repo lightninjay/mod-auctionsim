@@ -25,14 +25,19 @@ that file by hand.
 - You must be a GM to open this window (/auctionsim or /ahsim).
 
 
-2. Point the module at the bot character
-----------------------------------------
-- Click "Set Bot Char".
-- Type the character's name and click Okay.
-- The server looks the character up, writes its character id and account id to
-  auctionsim.conf, and - if the module is already enabled - switches the running
-  bot to it right away. No restart needed.
-- Success, or the reason it failed, shows in the Results box.
+2. Point the module at the bot character(s)
+-------------------------------------------
+- Edit auctionsim.conf directly and set one (or both) of:
+      AuctionSim.BotCharacterIDs = 12345
+      AuctionSim.BotAccountIDs = 67
+  BotCharacterIDs takes one or more character ids (comma-separated for more
+  than one). BotAccountIDs takes one or more account ids; every character on
+  each listed account is automatically added to the bot roster.
+- Restart the server, or run a live reload if your build exposes one, to pick
+  up the change.
+- There's no in-addon way to look this up by character name anymore -- with
+  multiple bot characters supported, a "type one name" popup stopped making
+  sense. Use your account/character DB to find the ids you need.
 
 
 3. Enable the module
@@ -76,7 +81,11 @@ Delete          Remove every auction the bot currently has listed.
 Show Queue      Show the buy queue size and when the next and last buy are due.
 Clean Over Cap  Remove bot auctions that are now above the level caps.
 Run Tests       Run the module's built-in self-tests; output goes to Results.
-Set Bot Char    Choose which character the bot uses (see step 2).
+Force Buy       Immediately buy the next queued purchase, without waiting for
+                its rolled buy time. Useful for testing a buy cycle on demand,
+                or draining the queue without deleting the bot's own listings
+                -- this actually buys the auction, same as it would have on
+                its own, just not waiting around for it.
 Help            This window.
 
 
