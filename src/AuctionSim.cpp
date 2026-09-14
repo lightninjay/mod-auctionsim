@@ -212,6 +212,11 @@ bool AuctionSim::StartOrReloadBot(bool reloadConfig)
 
 void AuctionSim::OnUpdate(uint32 diff)
 {
+    // Pumped unconditionally, before the isEnabled/buyingService check below --
+    // async price-suggestion lookups (Price Search tab, AuctionSimPublicPriceBridge)
+    // need to resolve even while the bot roster is disabled or has never started.
+    queryProcessor.ProcessReadyCallbacks();
+
     // isEnabled can be set before a bot exists (enabled via the addon), so check both
     if (!this->isEnabled || !buyingService) return;
 

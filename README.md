@@ -18,6 +18,12 @@ Every hour (fixed, not configurable), AuctionSim scans both auction houses:
    git clone https://github.com/Moloch17/mod-auctionsim.git
    ```
 2. Rebuild AzerothCore.
+3. Start the server once to let it apply this module's SQL (adds a supporting
+   index to `creature_loot_template`/`reference_loot_template` -- see
+   `data/sql/db-world/mod_auctionsim_loot_item_indexes.sql`). This happens
+   automatically via AzerothCore's normal DB updater; only run the file by
+   hand if your server has `Updates.EnableDatabases` turned off for the world
+   DB.
 
 **Notes:**
 - If you've previously used ah-bot or ah-bot-plus, there's no conflict, but the two cannot run at the same time -- disable other auction house bot modules before enabling this one.

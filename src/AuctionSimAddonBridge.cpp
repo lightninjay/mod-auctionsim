@@ -12,6 +12,7 @@
 #include "AuctionHouseMgr.h"
 #include "AuctionSim.h"
 #include "ItemPriceSuggestion.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Common.h"
 #include "Config.h"
@@ -487,24 +488,40 @@ namespace
             return;
         }
 
-        ItemPriceSuggestion::Suggestion s = ItemPriceSuggestion::Suggest(proto, itemId);
-        SendMessage(
-            target,
-            Acore::StringFormat(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                Msg::ItemPrice,
-                itemId,
-                "suggested",
-                s.marketPrice,
-                s.listLow,
-                s.listHigh,
-                s.typicalStack,
-                s.stackLow,
-                s.stackHigh,
-                neutralEligible ? 1 : 0,
-                s.basis));
+        // No scan/override data -- fall back to a heuristic suggestion. This
+        // involves a full-table-scan loot-table query (see ItemPriceSuggestion's
+        // doc comment), so it goes through the async path rather than blocking
+        // this hook: a GM's request can't be allowed to stall the whole server.
+        // target may log out or move on before the query resolves, so capture
+        // its GUID and re-resolve inside the callback rather than the raw
+        // pointer.
+        ObjectGuid targetGuid = target->GetGUID();
+        ItemPriceSuggestion::SuggestAsync(
+            proto, itemId,
+            [targetGuid, itemId, neutralEligible](ItemPriceSuggestion::Suggestion s)
+            {
+                Player* target = ObjectAccessor::FindPlayer(targetGuid);
+                if (!target)
+                {
+                    return;  // GM logged out or moved on before the lookup finished
+                }
+                SendMessage(
+                    target,
+                    Acore::StringFormat(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        Msg::ItemPrice,
+                        itemId,
+                        "suggested",
+                        s.marketPrice,
+                        s.listLow,
+                        s.listHigh,
+                        s.typicalStack,
+                        s.stackLow,
+                        s.stackHigh,
+                        neutralEligible ? 1 : 0,
+                        s.basis));
+            });
     }
-
     // Case-insensitive substring search, ASCII-only (item names in item_template
     // are English; this mirrors what the client types).
     bool ContainsCaseInsensitive(std::string_view haystack, std::string_view needle)

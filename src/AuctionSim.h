@@ -2,12 +2,14 @@
 #include <memory>
 #include <vector>
 #include "ASConfig.h"
+#include "AsyncCallbackProcessor.h"
 #include "AuctionBuyingService.h"
 #include "AuctionHouseMgr.h"
 #include "AuctionListingService.h"
 #include "AuctionSimTests.h"
 #include "BotPool.h"
 #include "Player.h"
+#include "QueryCallback.h"
 #include "ScriptMgr.h"
 
 class AuctionSim : public WorldScript
@@ -62,6 +64,13 @@ public:
     // load or none of the configured ids resolve.
     bool StartOrReloadBot(bool reloadConfig = true);
 
+    // Queues an async DB query's callback (see ItemPriceSuggestion::SuggestAsync)
+    // to be polled every OnUpdate tick until its result is ready. Pumped
+    // unconditionally, before the isEnabled/buyingService check in OnUpdate --
+    // live per-request lookups (Price Search tab, AuctionSimPublicPriceBridge)
+    // need to resolve even while the bot roster is stopped or was never started.
+    void AddQueryCallback(QueryCallback&& callback) { queryProcessor.AddCallback(std::move(callback)); }
+
     bool isEnabled;
     bool startupScan;  // cached so the addon bridge can read it back live
 
@@ -80,6 +89,7 @@ private:
     std::unique_ptr<AuctionListingService> listingService;
     std::unique_ptr<AuctionBuyingService> buyingService;
     uint32 scanTimer = 0;
+    AsyncCallbackProcessor<QueryCallback> queryProcessor;
 };
 class AuctionSimMailManager : public MailScript
 {

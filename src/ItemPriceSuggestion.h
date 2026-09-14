@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include "Define.h"
 
 class ItemTemplate;
@@ -28,8 +29,30 @@ namespace ItemPriceSuggestion
         char const* basis = "";
     };
 
-    // itemId is passed alongside proto so the drop-chance lookup (a DB query
-    // against creature_loot_template/reference_loot_template) can run without a
-    // second round trip through the caller.
+    // Synchronous: runs the drop-chance lookup (a query against
+    // creature_loot_template/reference_loot_template, WHERE Item = ..., which
+    // that pair's schema can't use its composite key for -- Entry leads the
+    // key, not Item -- so this is a full table scan) on the calling thread.
+    // Only call this where a multi-table-scan blocking DB query is acceptable:
+    // one-time bulk work at module load (see
+    // ASConfig::SynthesizeMissingNeutralItems), before the world tick loop (and
+    // this file's async plumbing below) is live. Do NOT call this from a live,
+    // per-request handler on the world thread -- that's exactly what stalls the
+    // whole server long enough to trip the watchdog. Use SuggestAsync there.
     Suggestion Suggest(ItemTemplate const* proto, uint32 itemId);
+
+    // Same computation as Suggest(), but for any live per-request caller
+    // (addon bridges, chat hooks) -- fires the drop-chance lookup via
+    // WorldDatabase.AsyncQuery instead of blocking the calling thread, and
+    // invokes `callback` with the finished Suggestion once it completes.
+    // Internally hands the pending query to AuctionSim::AddQueryCallback, so
+    // it's pumped every world tick regardless of caller.
+    //
+    // IMPORTANT: `callback` runs on a LATER world tick (possibly after the
+    // triggering Player has logged out or otherwise become invalid) --
+    // never capture a raw Player* into it. Capture an ObjectGuid and
+    // re-resolve via ObjectAccessor::FindPlayer inside the callback instead,
+    // and handle a null result (the player's gone) by simply not replying.
+    void SuggestAsync(ItemTemplate const* proto, uint32 itemId, std::function<void(Suggestion)> callback);
 }
+

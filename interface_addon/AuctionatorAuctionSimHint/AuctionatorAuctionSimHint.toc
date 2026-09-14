@@ -1,0 +1,7 @@
+## Interface: 30300
+## Title: Auctionator - AuctionSim Price Hint
+## Version: 1.0.0
+## Notes: Adds a read-only "AuctionSim suggests" price hint to Auctionator's Sell tab, sourced from the AuctionSim server module. Available to any character, not just GMs. Cannot change AuctionSim's pricing in any way.
+## Dependencies: Auctionator
+
+AuctionSimHint.lua

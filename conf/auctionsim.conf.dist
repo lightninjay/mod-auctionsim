@@ -127,3 +127,13 @@ AuctionSim.NeutralDepthScale = 0.5
 # needlessly hammers the auctionhouse tables. Default matches the old fixed
 # 60-minute cadence.
 AuctionSim.ScanIntervalMinutes = 60
+
+# How far below the guaranteed-buy price (the price at or under which
+# AuctionBuyingService always queues a purchase -- see ConsiderForPurchase) the
+# public, any-player price-suggestion endpoint suggests listing at. This is
+# what powers the read-only "AuctionSim suggests: X" hint some player-facing
+# addons (e.g. a small Auctionator hook) can show -- it never lets a player
+# see or change AuctionSim's own pricing data, just a number to list at.
+# 90 means "suggest 90% of the guaranteed-buy price," leaving the player some
+# room to price below it and still reliably get bought. Clamped to 50-100.
+AuctionSim.PlayerPriceSuggestMarginPercent = 90

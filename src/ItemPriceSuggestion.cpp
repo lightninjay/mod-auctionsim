@@ -2,8 +2,11 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <utility>
+#include "AuctionSim.h"
 #include "DatabaseEnv.h"
 #include "QueryResult.h"
+#include "StringFormat.h"
 #include "ItemTemplate.h"
 
 namespace
@@ -40,13 +43,18 @@ namespace
     // and reference_loot_template. Returns 100 (i.e. "not rare, no adjustment") if
     // the item isn't found in either -- most listable items are BoE/crafted/vendor
     // goods with no loot-table entry at all, and that's not evidence of rarity.
-    float AverageDropChancePercent(uint32 itemId)
+    //
+    // WHERE Item = ? can't use either table's primary key (both are keyed
+    // (Entry, Item, ...) -- Entry leads, not Item), so this is a full table scan
+    // every call. Shared by both the sync and async paths below; the SQL text
+    // itself doesn't change, only how it's run.
+    constexpr char const* kDropChanceSql =
+        "SELECT AVG(ABS(Chance)) FROM creature_loot_template WHERE Item = {} "
+        "UNION ALL "
+        "SELECT AVG(ABS(Chance)) FROM reference_loot_template WHERE Item = {}";
+
+    float AverageDropChanceFromResult(QueryResult const& result)
     {
-        QueryResult result = WorldDatabase.Query(
-            "SELECT AVG(ABS(Chance)) FROM creature_loot_template WHERE Item = {} "
-            "UNION ALL "
-            "SELECT AVG(ABS(Chance)) FROM reference_loot_template WHERE Item = {}",
-            itemId, itemId);
         if (!result)
         {
             return 100.0f;
@@ -71,6 +79,14 @@ namespace
         return total / static_cast<float>(rows);
     }
 
+    // Blocking: only used by the synchronous Suggest() path (see its doc comment
+    // in the header for exactly which callers that's still appropriate for).
+    float AverageDropChancePercentSync(uint32 itemId)
+    {
+        QueryResult result = WorldDatabase.Query(kDropChanceSql, itemId, itemId);
+        return AverageDropChanceFromResult(result);
+    }
+
     // Rarer drops warrant a higher suggested price; scale up as chance drops
     // below 100%, capped so a 0.01%-chance item doesn't suggest something absurd.
     float DropRarityFactor(float avgChancePercent)
@@ -85,20 +101,17 @@ namespace
         return itemClass == ITEM_CLASS_WEAPON || itemClass == ITEM_CLASS_ARMOR ||
                itemClass == ITEM_CLASS_QUIVER || itemClass == ITEM_CLASS_GEM;
     }
-}
 
-namespace ItemPriceSuggestion
-{
-    Suggestion Suggest(ItemTemplate const* proto, uint32 itemId)
+    // The actual suggestion math, shared by both Suggest() and SuggestAsync() --
+    // identical regardless of how avgDropChancePercent was obtained (blocking
+    // query vs. async callback). proto is assumed non-null; both public
+    // entry points check that before calling this.
+    ItemPriceSuggestion::Suggestion BuildSuggestion(ItemTemplate const* proto, float avgDropChancePercent)
     {
-        Suggestion s;
-        if (!proto)
-        {
-            return s;
-        }
+        ItemPriceSuggestion::Suggestion s;
 
         float qualityMult = QualityMultiplier(proto->Quality);
-        float dropFactor = DropRarityFactor(AverageDropChancePercent(itemId));
+        float dropFactor = DropRarityFactor(avgDropChancePercent);
 
         uint32 vendorAnchor = 0;
         char const* anchorLabel = "item level";
@@ -144,11 +157,51 @@ namespace ItemPriceSuggestion
         basisStorage = std::string("anchored on ") + anchorLabel +
             (dropFactor > 1.05f ? ", adjusted up for rare drop chance" : "");
         s.basis = basisStorage.c_str();
-        // basisStorage is thread_local and reused per call -- fine for the bridge's
-        // single-threaded "call Suggest, immediately format a reply" use, but the
-        // returned Suggestion::basis pointer must not be held past the next call
-        // on this thread.
+        // basisStorage is thread_local and reused per call -- fine as long as
+        // every caller (Suggest, and SuggestAsync's query callback) consumes
+        // Suggestion::basis immediately and doesn't hold the pointer past the
+        // next call on this thread.
 
         return s;
+    }
+}
+
+namespace ItemPriceSuggestion
+{
+    Suggestion Suggest(ItemTemplate const* proto, uint32 itemId)
+    {
+        if (!proto)
+        {
+            return {};
+        }
+        return BuildSuggestion(proto, AverageDropChancePercentSync(itemId));
+    }
+
+    void SuggestAsync(ItemTemplate const* proto, uint32 itemId, std::function<void(Suggestion)> callback)
+    {
+        if (!proto)
+        {
+            callback(Suggestion{});
+            return;
+        }
+
+        QueryCallback queryCallback = WorldDatabase.AsyncQuery(
+            Acore::StringFormat(kDropChanceSql, itemId, itemId));
+
+        queryCallback.WithCallback(
+            [proto, callback = std::move(callback)](QueryResult result) mutable
+            {
+                callback(BuildSuggestion(proto, AverageDropChanceFromResult(result)));
+            });
+
+        AuctionSim* sim = AuctionSim::instance();
+        if (!sim)
+        {
+            // Shutting down or not yet constructed -- nothing to pump this into;
+            // the query is simply dropped (matches how a since-logged-out Player
+            // would also never get a reply).
+            return;
+        }
+        sim->AddQueryCallback(std::move(queryCallback));
     }
 }
