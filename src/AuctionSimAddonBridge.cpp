@@ -2,8 +2,10 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <iterator>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include "ASConfig.h"
@@ -11,6 +13,7 @@
 #include "ASParse.h"
 #include "AuctionHouseMgr.h"
 #include "AuctionSim.h"
+#include "ItemEligibility.h"
 #include "ItemPriceSuggestion.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
@@ -75,6 +78,59 @@ namespace
     // SETCONFIG keys awaiting a SAVECONFIG. One global set: worldserver hooks are
     // single-threaded and there is one bot / one GM editing at a time.
     std::unordered_set<std::string> stagedKeys;
+
+    // ITEMSEARCH bounds. ITEMSEARCH is the only handler here that does work
+    // proportional to item_template size (~45k rows) on the world update thread;
+    // every other verb is a hash lookup or a small fixed amount of formatting.
+    // Unbounded, it is the module's most effective way to stall the map update
+    // loop, so it gets both a floor on input size and a ceiling on call rate.
+    constexpr size_t kMinSearchLength = 3;
+    constexpr auto kSearchCooldown = std::chrono::milliseconds(750);
+
+    // Last accepted ITEMSEARCH per GM. Same single-threaded justification as
+    // stagedKeys above. Pruned on every search so it stays small without needing
+    // a logout hook.
+    std::unordered_map<ObjectGuid, std::chrono::steady_clock::time_point> lastSearchAt;
+
+    // Separate cooldown/map for ITEMQUERY + ITEMHOUSEQUERY -- a single click on
+    // a search result sends both, so they share one bucket (gating them
+    // separately would let a click still burn double the intended budget). Much
+    // shorter than the search cooldown: each call here is a couple of hash
+    // lookups plus, on a cache miss, one entry into the global in-flight-query
+    // budget (see ItemPriceSuggestion's kMaxInFlightQueries) -- far cheaper than
+    // a full item_template scan, so it doesn't need anywhere near the same
+    // floor. This exists as its own gate rather than relying solely on that
+    // global budget so one runaway or malicious client can't eat the whole
+    // server's share of it by itself; a normal human clicking through results
+    // never notices this.
+    constexpr auto kItemQueryCooldown = std::chrono::milliseconds(150);
+    std::unordered_map<ObjectGuid, std::chrono::steady_clock::time_point> lastItemQueryAt;
+    // Separate map from lastItemQueryAt, not shared: a single click sends both
+    // ITEMQUERY and ITEMHOUSEQUERY nearly simultaneously, so gating them
+    // against the same bucket would always reject the second of the pair.
+    std::unordered_map<ObjectGuid, std::chrono::steady_clock::time_point> lastItemHouseQueryAt;
+
+    // Shared by every per-GM cooldown gate above: prunes expired entries (so
+    // none of these maps can grow with the number of GMs ever seen), then
+    // returns whether `guid` is still within `cooldown` of its last accepted
+    // call into `lastActionAt`. Consumes (records) the action on success.
+    bool ConsumeCooldownToken(
+        std::unordered_map<ObjectGuid, std::chrono::steady_clock::time_point>& lastActionAt,
+        ObjectGuid guid,
+        std::chrono::milliseconds cooldown)
+    {
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = lastActionAt.begin(); it != lastActionAt.end();)
+        {
+            it = (now - it->second >= cooldown) ? lastActionAt.erase(it) : std::next(it);
+        }
+        if (lastActionAt.find(guid) != lastActionAt.end())
+        {
+            return false;
+        }
+        lastActionAt[guid] = now;
+        return true;
+    }
 
     void SendMessage(Player* target, std::string const& body)
     {
@@ -440,6 +496,11 @@ namespace
     // numeric field is intentionally still editable client-side regardless of source.
     void HandleItemQuery(Player* target, std::vector<std::string_view> const& tokens)
     {
+        if (!ConsumeCooldownToken(lastItemQueryAt, target->GetGUID(), kItemQueryCooldown))
+        {
+            SendError(target, "Querying too fast -- try again shortly.");
+            return;
+        }
         if (tokens.size() < 2)
         {
             SendError(target, "ITEMQUERY needs an item id");
@@ -456,6 +517,18 @@ namespace
         if (!proto)
         {
             SendError(target, Acore::StringFormat("ITEMQUERY: no item_template for {}", itemId));
+            return;
+        }
+
+        // Re-checked here, not just in the search that produced the id: a client
+        // can send any id it likes, and a stale result list may still hold ids
+        // from before a filter change. Nothing downstream should ever see an
+        // item the search itself would refuse to show.
+        if (!ItemEligibility::IsAuctionableItem(*proto))
+        {
+            SendError(
+                target,
+                Acore::StringFormat("ITEMQUERY: item {} is not an auctionable item", itemId));
             return;
         }
 
@@ -522,20 +595,36 @@ namespace
                         s.basis));
             });
     }
+    // ASCII-only lowercase. Deliberately not std::tolower: that consults the
+    // current C locale on every call (and is not inlinable), which showed up as
+    // real cost when this runs ~45k times per search.
+    constexpr char LowerAscii(char c)
+    {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    }
+
     // Case-insensitive substring search, ASCII-only (item names in item_template
     // are English; this mirrors what the client types).
-    bool ContainsCaseInsensitive(std::string_view haystack, std::string_view needle)
+    //
+    // PERF: `loweredNeedle` must ALREADY be lowercased by the caller, once,
+    // outside the scan loop. The previous version heap-allocated two std::strings
+    // per candidate item -- ~90k allocations per search against a 45k-row
+    // item_template -- and re-lowercased the same needle for every single row.
+    // This version allocates nothing and lowercases only the haystack chars it
+    // actually has to compare.
+    bool ContainsCaseInsensitive(std::string_view haystack, std::string_view loweredNeedle)
     {
-        if (needle.empty())
+        if (loweredNeedle.empty())
         {
             return true;
         }
-        auto toLower = [](unsigned char c) { return static_cast<char>(std::tolower(c)); };
-        std::string h(haystack.size(), '\0');
-        std::string n(needle.size(), '\0');
-        std::transform(haystack.begin(), haystack.end(), h.begin(), toLower);
-        std::transform(needle.begin(), needle.end(), n.begin(), toLower);
-        return h.find(n) != std::string::npos;
+        if (haystack.size() < loweredNeedle.size())
+        {
+            return false;
+        }
+        return std::search(
+                   haystack.begin(), haystack.end(), loweredNeedle.begin(), loweredNeedle.end(),
+                   [](char a, char b) { return LowerAscii(a) == b; }) != haystack.end();
     }
 
     // Name lookup for the Price Search tab -- mirrors Auctionator's typed item
@@ -566,6 +655,51 @@ namespace
             needle += tokens[i];
         }
 
+        // Trim before measuring: item names are full of spaces, so an
+        // all-whitespace needle like "   " would otherwise clear the length gate
+        // below and still match essentially every row -- the exact query the gate
+        // exists to reject.
+        size_t first = needle.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos)
+        {
+            needle.clear();
+        }
+        else
+        {
+            needle = needle.substr(first, needle.find_last_not_of(" \t\r\n") - first + 1);
+        }
+
+        // --- Bound 1: reject needles too short to be a real search. ---------
+        // This runs on the world update thread, so its cost is charged directly
+        // against the map update tick. A 1-char needle matches ~95% of
+        // item_template, which is both useless as a result set and the most
+        // expensive possible query. Refuse it outright rather than serve it.
+        if (needle.size() < kMinSearchLength)
+        {
+            SendError(
+                target,
+                Acore::StringFormat("Search text must be at least {} characters.", kMinSearchLength));
+            return;
+        }
+
+        // --- Bound 2: per-GM rate limit. ------------------------------------
+        // The Lua panel only sends on click/Enter, but nothing stops a held Enter
+        // key, a macro, or a modified/third-party addon from sending these back to
+        // back. A few full item_template scans landing in a single tick is enough
+        // to blow the map update budget, and a sustained stream is what starves
+        // the watchdog heartbeat until it declares the process hung. The server
+        // must not rely on the client to pace this.
+        ObjectGuid guid = target->GetGUID();
+        if (!ConsumeCooldownToken(lastSearchAt, guid, kSearchCooldown))
+        {
+            SendError(target, "Searching too fast -- try again shortly.");
+            return;
+        }
+
+        // Lowercase the needle ONCE, not once per candidate row.
+        std::string loweredNeedle(needle.size(), '\0');
+        std::transform(needle.begin(), needle.end(), loweredNeedle.begin(), LowerAscii);
+
         ItemTemplateContainer const* store = sObjectMgr->GetItemTemplateStore();
 
         // Collect every match first and sort by name -- unordered_map iteration
@@ -578,16 +712,40 @@ namespace
             uint32 quality;
         };
         std::vector<Match> matches;
+        matches.reserve(64);
         for (auto const& [itemId, proto] : *store)
         {
-            if (!proto.Name1.empty() && ContainsCaseInsensitive(proto.Name1, needle))
+            if (!ItemEligibility::IsAuctionableItem(proto))
+            {
+                continue;
+            }
+            if (!proto.Name1.empty() && ContainsCaseInsensitive(proto.Name1, loweredNeedle))
             {
                 matches.push_back({itemId, &proto.Name1, proto.Quality});
             }
         }
-        std::sort(matches.begin(), matches.end(), [](Match const& a, Match const& b) { return *a.name < *b.name; });
 
         size_t shown = std::min(matches.size(), kMaxSearchResults);
+        // Only the rows actually sent need to be ordered. A full sort ordered all
+        // ~40k matches to then throw away all but 20; partial_sort is O(n log 20)
+        // instead of O(n log n) and leaves the reported total unchanged.
+        //
+        // Tie-break on itemId so this is a strict total order. item_template has
+        // many exact duplicate names (recipe/tokens/seasonal variants), and name
+        // alone left those tied -- with an unstable sort fed by arbitrary
+        // unordered_map iteration order, which of the tied rows landed in the top
+        // 20 could change between two identical searches. That is the shuffling
+        // this sort exists to prevent.
+        std::partial_sort(
+            matches.begin(), matches.begin() + shown, matches.end(),
+            [](Match const& a, Match const& b)
+            {
+                if (int cmp = a.name->compare(*b.name); cmp != 0)
+                {
+                    return cmp < 0;
+                }
+                return a.itemId < b.itemId;
+            });
         for (size_t i = 0; i < shown; ++i)
         {
             SendMessage(
@@ -652,6 +810,11 @@ namespace
     //   allianceHas\tallianceMarket\thordeHas\thordeMarket\tneutralHas\tneutralMarket
     void HandleItemHouseQuery(Player* target, std::vector<std::string_view> const& tokens)
     {
+        if (!ConsumeCooldownToken(lastItemHouseQueryAt, target->GetGUID(), kItemQueryCooldown))
+        {
+            SendError(target, "Querying too fast -- try again shortly.");
+            return;
+        }
         if (tokens.size() < 2)
         {
             SendError(target, "ITEMHOUSEQUERY needs an item id");

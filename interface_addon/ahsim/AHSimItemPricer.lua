@@ -159,7 +159,23 @@ function AHSim.BuildItemPricer()
 
     f.currentItemId = nil
 
+    -- Same guard as AHSimPriceSearchTab.lua's RequestPriceFor, same reason:
+    -- OnReceiveDrag and OnMouseUp (both wired below to TryAcceptCursorItem) can
+    -- both fire from one physical drop, which would otherwise send two
+    -- ITEMQUERY for a single drag. Hygiene, not a crash fix -- see that file's
+    -- comment for why this bears no resemblance to the frame-rate flood the
+    -- Auctionator companion addon had.
+    local lastRequestAt = {}
+    local MIN_REQUEST_INTERVAL = 1.0
+
     local function RequestPriceFor(itemId, itemLink)
+        local now = GetTime()
+        local last = lastRequestAt[itemId]
+        if last and (now - last) < MIN_REQUEST_INTERVAL then
+            return
+        end
+        lastRequestAt[itemId] = now
+
         f.currentItemId = itemId
         icon:SetTexture(GetItemIcon(itemId) or "Interface\\Icons\\INV_Misc_QuestionMark")
         itemNameText:SetText(itemLink or ("item:" .. itemId))

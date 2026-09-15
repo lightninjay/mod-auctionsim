@@ -48,11 +48,24 @@ namespace ItemPriceSuggestion
     // Internally hands the pending query to AuctionSim::AddQueryCallback, so
     // it's pumped every world tick regardless of caller.
     //
-    // IMPORTANT: `callback` runs on a LATER world tick (possibly after the
-    // triggering Player has logged out or otherwise become invalid) --
-    // never capture a raw Player* into it. Capture an ObjectGuid and
-    // re-resolve via ObjectAccessor::FindPlayer inside the callback instead,
-    // and handle a null result (the player's gone) by simply not replying.
+    // The drop-chance lookup is memoised per itemId, and concurrent requests for
+    // the same itemId share a single outstanding query. The loot tables this
+    // reads don't change while the world is running, so the cached answer never
+    // goes stale; it's dropped only if the cache hits its size cap. This matters
+    // because AuctionSimPublicPriceBridge exposes this path to every connected
+    // player: without it, repeated requests for one unpriced item each cost a
+    // full scan of creature_loot_template and reference_loot_template, which
+    // saturates the WorldDatabase worker pool even though it no longer blocks
+    // the world thread.
+    //
+    // IMPORTANT: `callback` may run on a later world tick (possibly after the
+    // triggering Player has logged out or otherwise become invalid) -- never
+    // capture a raw Player* into it. Capture an ObjectGuid and re-resolve via
+    // ObjectAccessor::FindPlayer inside the callback instead, and handle a null
+    // result (the player's gone) by simply not replying. On a cache hit the
+    // callback instead runs INLINE, before SuggestAsync returns; write callbacks
+    // so that either timing is correct, and don't rely on the caller's remaining
+    // statements having run by the time it fires.
     void SuggestAsync(ItemTemplate const* proto, uint32 itemId, std::function<void(Suggestion)> callback);
 }
 

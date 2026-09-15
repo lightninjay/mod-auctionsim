@@ -1,12 +1,16 @@
 #include "AuctionSimPublicPriceBridge.h"
 #include <algorithm>
 #include <charconv>
+#include <chrono>
+#include <iterator>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include "ASConfig.h"
 #include "AuctionSim.h"
 #include "Common.h"
 #include "Config.h"
+#include "ItemEligibility.h"
 #include "ItemPriceSuggestion.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
@@ -18,6 +22,77 @@ namespace
 {
     constexpr std::string_view kPrefix = "AHSIMPRICE";
     constexpr std::string_view kFullPrefixWithTab = "AHSIMPRICE\t";
+
+    // ---- Per-player rate limit --------------------------------------------
+    //
+    // This endpoint has no GM check by design, so anyone connected can drive it.
+    // ItemPriceSuggestion now memoises the expensive drop-chance query, which
+    // removes the database load, but each request still costs a hash lookup,
+    // a string format and an outbound whisper packet -- so the call rate itself
+    // still needs a ceiling.
+    //
+    // A token bucket rather than a flat cooldown, because the legitimate client
+    // pattern is bursty: an Auctionator-style hook asks about every item on an
+    // AH page or in a bag at once, then goes quiet. A flat cooldown would break
+    // that; a bucket absorbs the burst and only bites on sustained spam.
+    constexpr double kBurstTokens = 30.0;       // one AH page / full bag at once
+    constexpr double kRefillPerSecond = 10.0;   // sustained ceiling
+
+    struct RateBucket
+    {
+        double tokens = kBurstTokens;
+        std::chrono::steady_clock::time_point lastRefill;
+    };
+
+    // World-thread only, same as the rest of this module's hook state. Entries
+    // are pruned once a player's bucket has refilled to full, so this stays
+    // proportional to currently-active users rather than to everyone ever seen.
+    std::unordered_map<ObjectGuid, RateBucket> rateBuckets;
+
+    // Sweeping the whole map on every request is O(players) per request, i.e.
+    // O(players^2) per second of traffic -- measured at ~250ms of world-thread
+    // time per second at 3k population, which would reintroduce exactly the tick
+    // starvation this change exists to prevent. Sweep on a timer instead: the
+    // map only needs to not grow without bound, and it can never exceed the
+    // number of players who have sent a request since the last sweep.
+    constexpr auto kPruneInterval = std::chrono::seconds(60);
+    std::chrono::steady_clock::time_point lastPrune{};
+
+    bool ConsumeRequestToken(ObjectGuid guid)
+    {
+        auto now = std::chrono::steady_clock::now();
+
+        if (now - lastPrune >= kPruneInterval)
+        {
+            lastPrune = now;
+            for (auto it = rateBuckets.begin(); it != rateBuckets.end();)
+            {
+                double idleSeconds = std::chrono::duration<double>(now - it->second.lastRefill).count();
+                bool refilledToFull = it->second.tokens + idleSeconds * kRefillPerSecond >= kBurstTokens;
+                it = (refilledToFull && !(it->first == guid)) ? rateBuckets.erase(it) : std::next(it);
+            }
+        }
+
+        auto [entry, inserted] = rateBuckets.try_emplace(guid);
+        RateBucket& bucket = entry->second;
+        if (inserted)
+        {
+            bucket.lastRefill = now;
+        }
+        else
+        {
+            double elapsed = std::chrono::duration<double>(now - bucket.lastRefill).count();
+            bucket.tokens = std::min(kBurstTokens, bucket.tokens + elapsed * kRefillPerSecond);
+            bucket.lastRefill = now;
+        }
+
+        if (bucket.tokens < 1.0)
+        {
+            return false;
+        }
+        bucket.tokens -= 1.0;
+        return true;
+    }
 
     // Same self-whisper transport AuctionSimAddonBridge uses (see its header) --
     // reaches the client's CHAT_MSG_ADDON handler with no live bot character
@@ -61,6 +136,22 @@ namespace
 
     void HandlePriceRequest(Player* player, std::string_view payload)
     {
+        // Checked before parsing, so a flood of malformed payloads costs the same
+        // as a flood of well-formed ones.
+        if (!ConsumeRequestToken(player->GetGUID()))
+        {
+            // Deliberately the same "no data" shape this endpoint already returns
+            // for an unknown item or not-yet-loaded config, rather than a new
+            // status code: it keeps the wire format unchanged, and a client that
+            // is over its budget should behave exactly as it does when the server
+            // has nothing for that item -- show no suggestion and move on. The
+            // client is never left waiting on a reply that doesn't come.
+            uint32 requestedId = 0;
+            ParseUint32(payload, requestedId);
+            SendMessage(player, Acore::StringFormat("{}\t0\t0", requestedId));
+            return;
+        }
+
         uint32 itemId = 0;
         if (!ParseUint32(payload, itemId) || itemId == 0)
         {
@@ -73,6 +164,19 @@ namespace
 
         ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
         if (!proto)
+        {
+            SendMessage(player, Acore::StringFormat("{}\t0\t0", itemId));
+            return;
+        }
+
+        // Internal/QA/placeholder rows are never auctionable, so there is
+        // nothing meaningful to suggest -- and this endpoint is driven by a
+        // client tooltip hook, so it fires for whatever the player happens to
+        // hover, including rows the normal item pipeline never handles. Answer
+        // with the standard "no data" shape and do no further work: no scan
+        // lookup, and above all no async loot-table query for a row that should
+        // never have been priced in the first place.
+        if (!ItemEligibility::IsAuctionableItem(*proto))
         {
             SendMessage(player, Acore::StringFormat("{}\t0\t0", itemId));
             return;

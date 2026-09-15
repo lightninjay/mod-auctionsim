@@ -23,10 +23,19 @@ local tonumber = tonumber
 local ipairs = ipairs
 local OP = AHSim.OP
 
+local GetTime = GetTime
+
 local MAX_RESULT_ROWS = 20
 local ROW_HEIGHT = 20
 local LIST_WIDTH = 240
 local FIELD_WIDTH = 140
+
+-- Keep in sync with kMinSearchLength / kSearchCooldown in
+-- src/AuctionSimAddonBridge.cpp. The cooldown is set slightly above the
+-- server's 0.75s so a search the client lets through isn't then bounced by the
+-- server for arriving a few ms early.
+local MIN_SEARCH_LENGTH = 3
+local SEARCH_COOLDOWN = 0.8
 
 local EDITBOX_BACKDROP = {
     bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
@@ -255,6 +264,19 @@ function AHSim.BuildPriceSearchTab(panel)
     detail.currentItemId = nil
     detail.selectedHouse = nil
 
+    -- Guards the double-send this function is prone to: OnReceiveDrag and
+    -- OnMouseUp both fire from a single physical drop in some cases (see the
+    -- drop target's comment below), and nothing stops a GM from double-clicking
+    -- a search result. Neither is the frame-rate flood the Auctionator companion
+    -- addon had (that came from a tooltip hook re-firing every frame while an
+    -- item's data was pending, with no interval floor at all) -- a human
+    -- double-click or a doubled event for one drop tops out around 2 sends, not
+    -- 60/sec. This is hygiene, not a crash fix: avoid the wasted duplicate
+    -- round trip, and bring this file in line with the same minimum-interval
+    -- floor the companion addon now has everywhere it talks to the server.
+    local lastRequestAt = {}
+    local MIN_REQUEST_INTERVAL = 1.0
+
     local function SelectHouse(houseId)
         detail.selectedHouse = houseId
         for id, btn in pairs(houseButtons) do
@@ -266,6 +288,13 @@ function AHSim.BuildPriceSearchTab(panel)
     end
 
     local function RequestPriceFor(itemId, displayName)
+        local now = GetTime()
+        local last = lastRequestAt[itemId]
+        if last and (now - last) < MIN_REQUEST_INTERVAL then
+            return
+        end
+        lastRequestAt[itemId] = now
+
         detail.currentItemId = itemId
         detail.selectedHouse = nil
         for _, btn in pairs(houseButtons) do
@@ -293,12 +322,32 @@ function AHSim.BuildPriceSearchTab(panel)
         currentMatches = {}
     end
 
+    -- Mirrors the server's own bounds in AuctionSimAddonBridge.cpp
+    -- (kMinSearchLength / kSearchCooldown). The server enforces these regardless
+    -- -- it can't trust the client -- but checking here too means the GM gets
+    -- instant local feedback instead of a whisper round trip, and a held Enter
+    -- key never becomes a stream of requests in the first place.
+    local lastSearchAt = 0
+
     local function DoSearch()
         local text = strtrim(searchBox:GetText() or "")
         if text == "" then
             searchStatus:SetText("|cffff4040Type part of an item name.|r")
             return
         end
+        if text:len() < MIN_SEARCH_LENGTH then
+            searchStatus:SetText(sformat(
+                "|cffff4040Type at least %d characters.|r", MIN_SEARCH_LENGTH))
+            return
+        end
+
+        local now = GetTime()
+        if now - lastSearchAt < SEARCH_COOLDOWN then
+            searchStatus:SetText("|cffff4040Searching too fast -- wait a moment.|r")
+            return
+        end
+        lastSearchAt = now
+
         ClearResults()
         searchStatus:SetText("searching...")
         AHSim:Send(OP.ITEMSEARCH, text)
