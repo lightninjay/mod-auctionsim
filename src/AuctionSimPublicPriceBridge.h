@@ -13,12 +13,26 @@ class Player;
 //
 // This class NEVER calls anything that mutates ASConfig (no UpsertOverride, no
 // SetHouseOverride/ClearHouseOverride, no config writes, no bot/roster calls) --
-// it only reads via ASConfig::FindAnyScan and ItemPriceSuggestion's suggestion
-// functions (Suggest / SuggestAsync -- the latter used here: a per-item
-// drop-chance DB query has to go through AuctionSim::AddQueryCallback rather
-// than block this hook, or a burst of requests could stall the whole server).
-// If you're adding something here later, that read-only invariant is the whole
-// point of this file being separate: keep it that way.
+// it only reads via ASConfig::FindHouseScan (once for the requesting player's
+// own house, once for Neutral) and ItemPriceSuggestion's suggestion functions
+// (Suggest / SuggestAsync -- the latter used here: a per-item drop-chance DB
+// query has to go through AuctionSim::AddQueryCallback rather than block this
+// hook, or a burst of requests could stall the whole server). If you're adding
+// something here later, that read-only invariant is the whole point of this
+// file being separate: keep it that way.
+//
+// Every reply is faction-aware: the price quoted for a player's own house is
+// looked up via FindHouseScan(itemId, <that player's team's house>) -- never
+// FindAnyScan's "whichever house happened to scan first" -- because
+// AuctionSim.cpp's live buy pass (see ConsiderForPurchase's caller) evaluates
+// a listing strictly against the ScannedItem row for the house it was actually
+// posted on. Quoting a different house's number would describe a price the
+// bot might never honor for that player. Neutral is reported separately and
+// explicitly as unavailable when the item isn't on the AuctionSim.NeutralItems
+// allowlist (or Neutral is disabled entirely), rather than silently reusing
+// the home house's price, since Neutral is a curated, item-limited bucket
+// where most items are a guaranteed no-sale no matter what they're worth
+// elsewhere.
 //
 // Because there is no GM check, every request is metered by a per-player token
 // bucket (see ConsumeRequestToken in the .cpp) and the underlying drop-chance

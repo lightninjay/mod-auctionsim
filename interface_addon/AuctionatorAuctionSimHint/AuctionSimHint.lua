@@ -241,20 +241,20 @@ panelNeutralLine:SetPoint("TOPLEFT", panelHomeLine, "BOTTOMLEFT", 0, -2)
 panelNeutralLine:SetJustifyH("LEFT")
 panelNeutralLine:SetWidth(174)
 
--- Make the panel a child of Atr_SellControls. This is important: Auctionator's
--- main window is above UIParent's normal frame strata, so a UIParent child
--- positioned just below SellControls can be painted BEHIND Auctionator's own
--- background. Parenting it to SellControls guarantees it renders above that
--- background while still allowing the panel to extend below the 190x338 parent
--- (Auctionator does not enable child clipping here).
+-- Anchored below Atr_SellControls rather than inside/beside it: SellControls
+-- is a dense, fully laid-out 190x338 panel with no free space of its own
+-- (every pixel from y=-18 to y=-345 is already a label or input), so a new
+-- panel squeezed in there would either overlap something or need Auctionator's
+-- own layout to be touched. Below it is untouched space that moves correctly
+-- whenever SellControls itself is repositioned.
 if Atr_SellControls then
-    panel:SetParent(Atr_SellControls)
-    panel:SetFrameLevel(Atr_SellControls:GetFrameLevel() + 10)
     panel:SetPoint("TOPLEFT", Atr_SellControls, "BOTTOMLEFT", 0, -8)
 
-    -- Parent visibility automatically keeps the panel in sync with the Sell
-    -- tab. Keep the explicit Show/Hide hooks as well for Auctionator's existing
-    -- behavior and for the initial state.
+    -- Keep the panel's visibility in lockstep with the Sell tab itself --
+    -- Atr_SellControls:Show()/:Hide() is exactly how Auctionator marks
+    -- entering/leaving the Sell tab (see Auctionator.lua), so hooking both
+    -- (rather than polling tab state ourselves) means this can never drift
+    -- out of sync with which tab is actually open.
     hooksecurefunc(Atr_SellControls, "Show", function()
         panel:Show()
     end)
@@ -305,28 +305,26 @@ local function RefreshPanel()
 end
 
 -- Called whenever the item sitting in the Sell tab's "item to auction" slot
--- might have changed. Use Auctionator's own Atr_GetSellItemInfo() here rather
--- than GetAuctionSellItemInfo()+GetItemInfo(name). The latter can return the
--- item name while the item-link cache is not ready yet, which leaves us with
--- no item ID even though Auctionator itself already has the exact sell link.
--- Atr_GetSellItemInfo() is the same helper Auctionator uses in
--- Atr_OnNewAuctionUpdate(), and obtains the link through its scanning tooltip.
+-- might have changed. Resolves it the same way Auctionator's own
+-- SetAuctionSellItem hook does (GetAuctionSellItemInfo -> GetItemInfo for a
+-- link, see AuctionatorHints.lua), independently of anything Auctionator
+-- itself currently has cached about that item.
 local function UpdateFromSellSlot()
-    if type(Atr_GetSellItemInfo) ~= "function" then
+    local name = GetAuctionSellItemInfo()
+    if not name then
         currentItemId = nil
         RefreshPanel()
         return
     end
 
-    local name, count, link = Atr_GetSellItemInfo()
-    if not name or name == "" or not link then
-        currentItemId = nil
-        RefreshPanel()
-        return
-    end
-
+    local _, link = GetItemInfo(name)
     local itemId = ItemIdFromLink(link)
     if not itemId then
+        -- Name resolved but GetItemInfo hasn't cached this item server-side
+        -- yet (can happen for an item never seen this session) -- it'll
+        -- resolve within a moment of the client receiving the data and the
+        -- next NEW_AUCTION_UPDATE/refresh will pick it up; nothing to show
+        -- meanwhile.
         currentItemId = nil
         RefreshPanel()
         return
@@ -348,7 +346,7 @@ updateFrame:SetScript("OnEvent", UpdateFromSellSlot)
 -- on the next NEW_AUCTION_UPDATE.
 eventFrame:HookScript("OnEvent", function(self, event, prefix, message)
     if event == "CHAT_MSG_ADDON" and prefix == PREFIX then
-        local itemId = tonumber(strsplit("\t", message))
+        local itemId = tonumber((strsplit("\t", message)))
         if itemId and itemId == currentItemId then
             RefreshPanel()
         end

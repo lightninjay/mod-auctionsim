@@ -7,6 +7,7 @@
 #include <string_view>
 #include <unordered_map>
 #include "ASConfig.h"
+#include "AuctionHouseMgr.h"
 #include "AuctionSim.h"
 #include "Common.h"
 #include "Config.h"
@@ -134,6 +135,119 @@ namespace
         return static_cast<uint32>(std::max<uint64>(suggested, 1));
     }
 
+    // A player can only ever browse the Alliance or Horde auction house that
+    // matches their own team (plus Neutral, which both factions can reach) --
+    // there is no client-side way for them to accidentally look at the other
+    // faction's house. That means "the house AuctionBuyingService will actually
+    // evaluate this player's listing against" is fully determined by team, with
+    // no ambiguity to ask the client about. AuctionSim.cpp's live buy pass keys
+    // its ScannedItem lookup off the auction's own house
+    // (config->FindScannedItem(_AuctionHouseId, ...)) -- never off some
+    // item-wide "best guess" -- so replying with anything other than this
+    // player's own house's row would describe a price the bot might never
+    // actually honor for them.
+    AuctionHouseId ResolveHomeHouse(Player* player)
+    {
+        return player->GetTeamId() == TEAM_ALLIANCE ? AuctionHouseId::Alliance : AuctionHouseId::Horde;
+    }
+
+    // What's actually sitting on the auction house right now for this item, on
+    // this house -- as opposed to ScannedItem::GetListLow(), which is a
+    // historical/statistical reference the bot uses to decide what price to
+    // roll for its OWN new listings, not a live read of the shelf. The two can
+    // legitimately disagree: GetListLow reflects the broader reference economy
+    // this item was scanned from, while this reflects only what this specific,
+    // possibly much smaller or larger, live house happens to have posted at
+    // this exact moment. Reporting the static number as "current low" was the
+    // actual bug being fixed here -- a player comparing their own listing
+    // against "the low end of the market" needs to know what a buyer would
+    // actually see sitting on the house today, not a number derived from
+    // reference data that may never have existed on this house at all.
+    //
+    // Pure in-memory scan (GetAuctions() is the live AuctionHouseObject map,
+    // no DB access), bounded by how many auctions are currently on this one
+    // house, and gated behind the same per-player rate limit as everything
+    // else this file does -- there is no unbounded-cost path here.
+    uint32 FindLowestCurrentListing(AuctionHouseId houseId, uint32 itemTemplateId)
+    {
+        AuctionHouseObject* house = sAuctionMgr->GetAuctionsMapByHouseId(houseId);
+        if (!house)
+        {
+            return 0;
+        }
+
+        uint32 lowest = 0;
+        for (auto const& entry : house->GetAuctions())
+        {
+            AuctionEntry const* auction = entry.second;
+            if (auction->item_template != itemTemplateId || auction->itemCount == 0)
+            {
+                continue;
+            }
+            uint32 pricePerItem = auction->buyout / auction->itemCount;
+            if (pricePerItem == 0)
+            {
+                continue;  // no valid buyout on this listing (bid-only or similar) -- not a comparable "price"
+            }
+            if (lowest == 0 || pricePerItem < lowest)
+            {
+                lowest = pricePerItem;
+            }
+        }
+        return lowest;
+    }
+
+    // Every "no data" / "nothing to say about this item" reply, in one place,
+    // so every early-out below produces the exact same nine-field shape rather
+    // than each bailout hand-rolling its own field count -- a mismatch there
+    // would desync the addon's strsplit on a path that's easy to not exercise
+    // in testing (unknown item, config not loaded, etc.).
+    std::string NoDataReply(uint32 itemId)
+    {
+        return Acore::StringFormat("{}\t0\t0\t0\t0\t0\t0\t0\t0", itemId);
+    }
+
+    // Looks up the Neutral-house row for `itemId`, but only if the item is
+    // actually reachable there at all. AuctionSim.NeutralItems is a curated
+    // allowlist (see ASConfig::neutralEligibleItems's doc comment) -- most
+    // items are never filed into the Neutral bucket no matter what real AH
+    // data exists for them, so an item can have a perfectly good Alliance or
+    // Horde price and still be a guaranteed no-sale on Neutral. Reporting
+    // "not available here" for those (rather than silently reusing the home
+    // house's number) is the whole point of this helper: it lets the client
+    // tell a player "list this on your own AH instead" instead of quoting a
+    // price the Neutral bot will never actually pay.
+    struct NeutralQuote
+    {
+        bool available = false;  // item can ever sell on Neutral at all
+        uint32 floor = 0;
+        uint32 low = 0;
+        bool hasRealData = false;
+    };
+
+    NeutralQuote ResolveNeutralQuote(ASConfig const* config, uint32 itemId)
+    {
+        NeutralQuote quote;
+        if (!config->enableNeutralAH || !config->IsNeutralEligible(itemId))
+        {
+            return quote;  // guaranteed no-sale here regardless of any scan data
+        }
+
+        quote.available = true;
+        quote.low = FindLowestCurrentListing(AuctionHouseId::Neutral, itemId);
+        if (ScannedItem const* row = config->FindHouseScan(itemId, AuctionHouseId::Neutral))
+        {
+            quote.floor = ApplyMargin(row->GetMarketPrice());
+            quote.hasRealData = true;
+        }
+        // else: on the allowlist but SynthesizeMissingNeutralItems hasn't filed
+        // a row yet (e.g. mid-startup) -- available stays true (it WILL sell
+        // there), but with no floor to show yet; hasRealData/floor stay 0.
+        // quote.low is independent of this and reports real listings either way.
+        return quote;
+
+    }
+
     void HandlePriceRequest(Player* player, std::string_view payload)
     {
         // Checked before parsing, so a flood of malformed payloads costs the same
@@ -142,30 +256,30 @@ namespace
         {
             // Deliberately the same "no data" shape this endpoint already returns
             // for an unknown item or not-yet-loaded config, rather than a new
-            // status code: it keeps the wire format unchanged, and a client that
-            // is over its budget should behave exactly as it does when the server
+            // status code: it keeps the wire format simple, and a client that is
+            // over its budget should behave exactly as it does when the server
             // has nothing for that item -- show no suggestion and move on. The
             // client is never left waiting on a reply that doesn't come.
             uint32 requestedId = 0;
             ParseUint32(payload, requestedId);
-            SendMessage(player, Acore::StringFormat("{}\t0\t0", requestedId));
+            SendMessage(player, NoDataReply(requestedId));
             return;
         }
 
         uint32 itemId = 0;
         if (!ParseUint32(payload, itemId) || itemId == 0)
         {
-            SendMessage(player, "0\t0\t0");  // malformed request -- reply with an
-                                              // obviously-invalid result rather
-                                              // than nothing, so the client isn't
-                                              // left waiting forever.
+            SendMessage(player, NoDataReply(0));  // malformed request -- reply with an
+                                                   // obviously-invalid result rather
+                                                   // than nothing, so the client isn't
+                                                   // left waiting forever.
             return;
         }
 
         ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
         if (!proto)
         {
-            SendMessage(player, Acore::StringFormat("{}\t0\t0", itemId));
+            SendMessage(player, NoDataReply(itemId));
             return;
         }
 
@@ -178,7 +292,7 @@ namespace
         // never have been priced in the first place.
         if (!ItemEligibility::IsAuctionableItem(*proto))
         {
-            SendMessage(player, Acore::StringFormat("{}\t0\t0", itemId));
+            SendMessage(player, NoDataReply(itemId));
             return;
         }
 
@@ -187,44 +301,79 @@ namespace
         if (!config)
         {
             // Module hasn't finished loading its pricing data yet.
-            SendMessage(player, Acore::StringFormat("{}\t0\t0", itemId));
+            SendMessage(player, NoDataReply(itemId));
             return;
         }
 
-        // hasRealData (the third field) distinguishes real scan/GM-priced data
-        // from a pure ItemPriceSuggestion guess, so the client can show an
-        // appropriate confidence level -- this endpoint never says which it
-        // used beyond that one flag, and never exposes anything else about the
-        // item's pricing (no stack sizes, no per-house breakdown, no listing
-        // counts).
-        if (ScannedItem const* row = config->FindAnyScan(itemId))
+        AuctionHouseId homeHouse = ResolveHomeHouse(player);
+        uint32 homeHouseNum = static_cast<uint32>(homeHouse);
+
+        // hasRealData distinguishes real scan/GM-priced data from a pure
+        // ItemPriceSuggestion guess, so the client can show an appropriate
+        // confidence level for each house independently -- this endpoint never
+        // exposes anything else about the item's pricing (no stack sizes, no
+        // listing counts).
+        if (ScannedItem const* homeRow = config->FindHouseScan(itemId, homeHouse))
         {
             // Already in memory -- no DB round trip needed, reply immediately.
-            SendMessage(player, Acore::StringFormat("{}\t{}\t{}", itemId, ApplyMargin(row->GetMarketPrice()), 1));
+            NeutralQuote neutral = ResolveNeutralQuote(config, itemId);
+            SendMessage(
+                player,
+                Acore::StringFormat(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    itemId,
+                    homeHouseNum,
+                    ApplyMargin(homeRow->GetMarketPrice()),
+                    1,
+                    FindLowestCurrentListing(homeHouse, itemId),
+                    neutral.available ? 1 : 0,
+                    neutral.floor,
+                    neutral.hasRealData ? 1 : 0,
+                    neutral.low));
             return;
         }
 
-        // No scan/override data -- ItemPriceSuggestion::Suggest would run a
-        // full-table-scan loot-table query (see its doc comment: neither
-        // creature_loot_template nor reference_loot_template can use their
-        // composite key for a plain "WHERE Item = ?"). This endpoint is open to
-        // every connected player with no rate limiting, so running that
+        // No scan/override data for this player's own house -- ItemPriceSuggestion
+        // ::Suggest would run a full-table-scan loot-table query (see its doc
+        // comment: neither creature_loot_template nor reference_loot_template can
+        // use their composite key for a plain "WHERE Item = ?"). This endpoint is
+        // open to every connected player with no GM check, so running that
         // synchronously here is exactly the kind of thing that stalls the whole
         // server long enough to trip the watchdog -- go through the async path
         // instead. player may log out or move on before the query resolves, so
-        // capture its GUID and re-resolve inside the callback rather than the
-        // raw pointer.
+        // capture its GUID and re-resolve inside the callback rather than the raw
+        // pointer -- and re-fetch ASConfig too, rather than capturing this
+        // request's `config`, since a GM ".auctionsim reload" can replace it
+        // (AuctionSim::StartOrReloadBot resets the unique_ptr) while the async
+        // loot-table query is still in flight.
         ObjectGuid playerGuid = player->GetGUID();
         ItemPriceSuggestion::SuggestAsync(
             proto, itemId,
-            [playerGuid, itemId](ItemPriceSuggestion::Suggestion s)
+            [playerGuid, itemId, homeHouseNum](ItemPriceSuggestion::Suggestion s)
             {
                 Player* player = ObjectAccessor::FindPlayer(playerGuid);
                 if (!player)
                 {
                     return;  // player logged out or moved on before the lookup finished
                 }
-                SendMessage(player, Acore::StringFormat("{}\t{}\t{}", itemId, ApplyMargin(s.marketPrice), 0));
+
+                AuctionSim* sim = AuctionSim::instance();
+                ASConfig const* config = sim ? sim->GetConfig() : nullptr;
+                NeutralQuote neutral = config ? ResolveNeutralQuote(config, itemId) : NeutralQuote{};
+
+                SendMessage(
+                    player,
+                    Acore::StringFormat(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        itemId,
+                        homeHouseNum,
+                        ApplyMargin(s.marketPrice),
+                        0,
+                        FindLowestCurrentListing(static_cast<AuctionHouseId>(homeHouseNum), itemId),
+                        neutral.available ? 1 : 0,
+                        neutral.floor,
+                        neutral.hasRealData ? 1 : 0,
+                        neutral.low));
             });
     }
 }

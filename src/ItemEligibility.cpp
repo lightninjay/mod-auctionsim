@@ -76,12 +76,21 @@ namespace
     }
 
     // Item classes that are never player-auctionable regardless of their data.
-    // Quest items and keys are soulbound-by-nature; money/permanent are internal
-    // container classes that never exist as a real inventory item.
+    //
+    // Neither ITEM_CLASS_QUEST nor ITEM_CLASS_KEY is excluded here. Both classes
+    // contain a mix of soulbound-and-tradeable rows -- e.g. item 2748 "Green
+    // Hills of Stranglethorn" (quest) and various dungeon/vendor keys that are
+    // legitimately bought and sold on the AH -- so filtering by class swept up
+    // real tradeable items along with the soulbound ones. The BIND_WHEN_PICKED_UP
+    // check just above this function is what actually catches the untradeable
+    // members of both classes, and it does so precisely (per-item, off Blizzard's
+    // own Bonding field) rather than banning an entire class to get at them.
+    //
+    // Money/permanent are still excluded: those are internal container classes
+    // that never exist as a real inventory item, tradeable or not.
     bool IsNonAuctionableClass(uint32 itemClass)
     {
-        return itemClass == ITEM_CLASS_QUEST || itemClass == ITEM_CLASS_KEY ||
-               itemClass == ITEM_CLASS_MONEY || itemClass == ITEM_CLASS_PERMANENT;
+        return itemClass == ITEM_CLASS_MONEY || itemClass == ITEM_CLASS_PERMANENT;
     }
 }
 
