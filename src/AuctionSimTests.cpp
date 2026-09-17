@@ -559,6 +559,13 @@ namespace
                     {
                         continue;
                     }
+                    // Same reasoning as FindAnyResolvableCandidate below: a
+                    // candidate excluded on this house can never actually list,
+                    // regardless of what this or that test is trying to isolate.
+                    if (config.IsItemExcludedFromHouse(item->GetItemID(), houseId))
+                    {
+                        continue;
+                    }
                     if (!AuctionPricing::IsWithinLevelCap(
                             proto->RequiredLevel, proto->ItemLevel, config.maxRequiredLevel, config.maxItemLevel))
                     {
@@ -587,6 +594,21 @@ namespace
                 {
                     ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item->GetItemID());
                     if (!proto)
+                    {
+                        continue;
+                    }
+                    // A candidate this test's own "disabled caps" sub-check would
+                    // never be able to list is the wrong candidate to pick, full
+                    // stop -- AuctionSim.ItemExceptions/ItemExceptionFiles always
+                    // wins over level caps (by design: exclusion is an absolute
+                    // block, not a level-based one), so an excluded item fails the
+                    // disabled-caps listing regardless of whether level-cap
+                    // enforcement itself is working. That's a wrong-candidate bug
+                    // in this function, not a real level-cap regression -- skip
+                    // anything excluded on this house so the picked candidate can
+                    // only ever fail the sub-checks this test actually means to
+                    // exercise.
+                    if (config.IsItemExcludedFromHouse(item->GetItemID(), houseId))
                     {
                         continue;
                     }

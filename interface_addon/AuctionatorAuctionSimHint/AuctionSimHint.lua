@@ -346,7 +346,7 @@ updateFrame:SetScript("OnEvent", UpdateFromSellSlot)
 -- on the next NEW_AUCTION_UPDATE.
 eventFrame:HookScript("OnEvent", function(self, event, prefix, message)
     if event == "CHAT_MSG_ADDON" and prefix == PREFIX then
-        local itemId = tonumber((strsplit("\t", message)))
+        local itemId = tonumber(strsplit("\t", message))
         if itemId and itemId == currentItemId then
             RefreshPanel()
         end
