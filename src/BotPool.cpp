@@ -133,12 +133,7 @@ BotPool::BotPool(bool& outBuilt)
             0,
             false,
             false,
-            0,
-            true);  // is_bot: this fork's WorldSession (mod-playerbots/Grimfeather branch) adds a
-                    // trailing is_bot flag for exactly this case -- a headless, socket-less session
-                    // driving a real character. Marking it true keeps AuctionSim's bots consistent
-                    // with how the core's own playerbots identify themselves, in case any playerbots-
-                    // side logic (chat routing, bot-vs-real-player bookkeeping) branches on IsBot().
+            0);
         entry.player = std::make_unique<Player>(entry.session.get());
         entry.player->Initialize(characterID);
 
